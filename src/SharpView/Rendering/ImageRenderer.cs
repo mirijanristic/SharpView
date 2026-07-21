@@ -270,14 +270,32 @@ sealed class ImageRenderer : IDisposable
 
         // Pixel-accurate transform: at zoom z the image is drawn at (texW*z × texH*z)
         // viewport pixels, so Fit and 1:1 behave exactly as their names promise.
-        float sx = _texW * _view.Zoom / viewW;
-        float sy = _texH * _view.Zoom / viewH;
+        float drawW = _texW * _view.Zoom;
+        float drawH = _texH * _view.Zoom;
 
-        float ox = _view.PanX * 2f / viewW;
-        float oy = -_view.PanY * 2f / viewH;
+        // Top-left corner of the destination rectangle in viewport pixels.
+        float left = (viewW - drawW) * 0.5f + _view.PanX;
+        float top = (viewH - drawH) * 0.5f + _view.PanY;
+
+        // Pixel snapping: once the animation has settled, round the corner onto the
+        // pixel grid. Without this, an odd (viewport − image) difference leaves the
+        // image centered on a HALF-pixel, so at 1:1 every screen pixel samples the
+        // average of two texels and the whole picture looks slightly blurred. With
+        // the snap, 1:1 maps each texel to exactly one pixel — bit-perfect display.
+        // (Not applied mid-animation, so zoom/pan transitions stay sub-pixel smooth.)
+        if (_view.IsSettled)
+        {
+            left = MathF.Round(left);
+            top = MathF.Round(top);
+        }
+
+        float sx = drawW / viewW;
+        float sy = drawH / viewH;
+        float tx = (left + drawW * 0.5f) / viewW * 2f - 1f;
+        float ty = 1f - (top + drawH * 0.5f) / viewH * 2f;
 
         var xform = Matrix4x4.CreateScale(sx, sy, 1f)
-                  * Matrix4x4.CreateTranslation(ox, oy, 0f);
+                  * Matrix4x4.CreateTranslation(tx, ty, 0f);
 
         var cb = new ViewConstants
         {
@@ -307,10 +325,24 @@ sealed class ImageRenderer : IDisposable
         _view.Fit(_texW, _texH, viewW, viewH);
     }
 
-    /// <summary>Fit to window without animation (used at startup).</summary>
-    public void FitToWindowInstant(int viewW, int viewH)
+    /// <summary>
+    /// Show the image at true 1:1 when it fully fits inside the viewport, otherwise
+    /// fit it to the window. Small images are never upscaled just to fill the view.
+    /// Animated (used when navigating between images).
+    /// </summary>
+    public void FitOrOneToOne(int viewW, int viewH)
     {
-        FitToWindow(viewW, viewH);
+        if (!HasImage) return;
+        if (_texW <= viewW && _texH <= viewH)
+            _view.SetOneToOne();
+        else
+            _view.Fit(_texW, _texH, viewW, viewH);
+    }
+
+    /// <summary>Same policy without animation (used at startup).</summary>
+    public void FitOrOneToOneInstant(int viewW, int viewH)
+    {
+        FitOrOneToOne(viewW, viewH);
         _view.SnapToTargets();
     }
 

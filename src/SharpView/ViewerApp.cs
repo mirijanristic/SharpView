@@ -54,6 +54,12 @@ sealed class ViewerApp : IDisposable
             KeyPreview = true,
         };
 
+        // Title-bar / Alt-Tab icon: reuse the icon embedded into the EXE via
+        // <ApplicationIcon>icon.ico</ApplicationIcon> in the .csproj, so icon.ico
+        // does not need to ship next to the executable.
+        try { _form.Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath); }
+        catch { /* missing/odd icon resource — keep the default form icon */ }
+
         _btnOneToOne = new Button
         {
             Text = "1:1",
@@ -94,9 +100,10 @@ sealed class ViewerApp : IDisposable
         _thumbStrip = new ThumbnailStrip(_res, _thumbCache);
 
         // Decode the initial image synchronously; the GPU upload itself is recorded
-        // into the first frame's command list. No animation on first show.
+        // into the first frame's command list. No animation on first show:
+        // true 1:1 when the image fits the window, fit-to-window when it is bigger.
         _imageRenderer.LoadImageSync(_initialImagePath);
-        _imageRenderer.FitToWindowInstant(_width, MainViewHeight);
+        _imageRenderer.FitOrOneToOneInstant(_width, MainViewHeight);
 
         _nav.ScanFolder(_initialImagePath);
         _thumbStrip.SnapToIndex(_nav.CurrentIndex, _width);
@@ -159,10 +166,11 @@ sealed class ViewerApp : IDisposable
         float dt = Math.Clamp((float)(now - _lastFrameTime), 0.0001f, 0.1f);
         _lastFrameTime = now;
 
-        // A newly decoded main image? Publish its dimensions and re-fit the view;
-        // the GPU upload itself is recorded in RenderFrame.
+        // A newly decoded main image? Publish its dimensions and set the view:
+        // 1:1 when it fits, fit-to-window when it is bigger (same as startup).
+        // Prefer the old always-fit behavior? Revert this line to FitToWindow.
         if (_imageRenderer.PollDecodedImage())
-            _imageRenderer.FitToWindow(_width, MainViewHeight);
+            _imageRenderer.FitOrOneToOne(_width, MainViewHeight);
 
         _imageRenderer.Update(dt, _width, MainViewHeight);
         _thumbStrip.Update(dt, _width, _height, _nav);
