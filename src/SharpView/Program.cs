@@ -1,4 +1,5 @@
 using SharpView.Platform;
+using SharpView.Services;
 
 namespace SharpView;
 
@@ -36,10 +37,14 @@ internal static class Program
 
             if (imagePath is null)
             {
+                string exts = "*.png;*.jpg;*.jpeg;*.bmp;*.gif;*.tif;*.tiff";
+                if (ImageDecoder.SupportsWebp) exts += ";*.webp";
+                if (ImageDecoder.SupportsHeif) exts += ";*.heic;*.heif";
+
                 using var ofd = new OpenFileDialog
                 {
                     Title = "Select an image to view",
-                    Filter = "Image Files|*.png;*.jpg;*.jpeg;*.bmp;*.gif;*.tif;*.tiff|All Files|*.*",
+                    Filter = $"Image Files|{exts}|All Files|*.*",
                 };
                 if (ofd.ShowDialog() != DialogResult.OK) return 0;
                 imagePath = ofd.FileName;

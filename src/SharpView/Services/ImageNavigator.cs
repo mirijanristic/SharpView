@@ -5,13 +5,21 @@ namespace SharpView.Services;
 /// </summary>
 sealed class ImageNavigator
 {
-    // Note: .webp is intentionally absent — the GDI+ decoder (System.Drawing)
-    // cannot open WebP, so listing it only produced silently-failing entries.
-    // Add it back once decoding moves to WIC/Windows Imaging Component.
-    static readonly HashSet<string> SupportedExtensions = new(StringComparer.OrdinalIgnoreCase)
+    // Base set is always decodable (WIC or the GDI+ fallback). WebP and HEIC are
+    // added at runtime only when the corresponding WIC codec extension is installed
+    // on this machine, so no silently-failing entries ever appear in the strip.
+    static readonly HashSet<string> SupportedExtensions = BuildSupportedExtensions();
+
+    static HashSet<string> BuildSupportedExtensions()
     {
-        ".png", ".jpg", ".jpeg", ".bmp", ".gif", ".tiff", ".tif"
-    };
+        var set = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        {
+            ".png", ".jpg", ".jpeg", ".bmp", ".gif", ".tiff", ".tif"
+        };
+        if (ImageDecoder.SupportsWebp) set.Add(".webp");
+        if (ImageDecoder.SupportsHeif) { set.Add(".heic"); set.Add(".heif"); }
+        return set;
+    }
 
     string[] _files = Array.Empty<string>();
     int _currentIndex;

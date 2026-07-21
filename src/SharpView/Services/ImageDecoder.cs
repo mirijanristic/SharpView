@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Drawing.Imaging;
 using System.Runtime.CompilerServices;
 
@@ -7,25 +8,54 @@ using GdiRectangle = System.Drawing.Rectangle;
 namespace SharpView.Services;
 
 /// <summary>
-/// Decodes image files into raw 32bpp BGRA pixel data using GDI+ (System.Drawing).
-/// Pure CPU work with no GPU dependencies, so it is safe to call from any thread.
+/// Decodes image files into raw 32bpp BGRA pixel data. Pure CPU work with no GPU
+/// dependencies, so it is safe to call from any thread.
 /// </summary>
 /// <remarks>
-/// BGRA is GDI+'s native 32bpp memory layout, so no per-pixel channel swizzle is
-/// needed — rows are copied with straight memcpy and uploaded into
-/// <c>B8G8R8A8_UNorm</c> textures (see <see cref="Core.DeviceResources.TextureFormat"/>).
-/// This removed the old per-pixel BGRA→RGBA loop, which dominated decode time for
-/// large images.
+/// Decoding uses WIC (<see cref="WicDecoder"/>) when available: several times
+/// faster than GDI+, thumbnails of large JPEGs decode directly at reduced
+/// resolution (native codec scaling), and WebP/HEIC become readable when the
+/// Windows codec extensions are installed. If WIC fails for any reason, the
+/// original GDI+ (System.Drawing) path below is used automatically, so behavior
+/// can only improve, never regress.
+/// BGRA output matches <see cref="Core.DeviceResources.TextureFormat"/>, so pixels
+/// are uploaded with straight memcpy — no per-pixel channel swizzle.
 /// </remarks>
 static unsafe class ImageDecoder
 {
+    /// <summary>True when .webp is decodable on this machine (WIC + "WebP Image Extensions").</summary>
+    public static bool SupportsWebp => WicDecoder.HasWebp;
+
+    /// <summary>True when .heic/.heif is decodable on this machine (WIC + "HEIF Image Extensions").</summary>
+    public static bool SupportsHeif => WicDecoder.HasHeif;
+
     /// <summary>
     /// Decodes an image file into tightly packed BGRA pixel bytes. Returns dimensions
     /// via out params. Optionally resizes to fit within <paramref name="maxDimension"/>.
-    /// <paramref name="lowQuality"/> uses nearest-neighbor scaling (fast, for thumbnails).
+    /// <paramref name="lowQuality"/> uses cheaper scaling (for thumbnails).
     /// </summary>
     public static byte[] DecodeToBgra(string path, out int width, out int height,
                                       int maxDimension = 0, bool lowQuality = false)
+    {
+        if (WicDecoder.IsAvailable)
+        {
+            try
+            {
+                return WicDecoder.DecodeToBgra(path, out width, out height, maxDimension, lowQuality);
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"[ImageDecoder] WIC failed for '{path}', falling back to GDI+: {ex.Message}");
+            }
+        }
+
+        return GdiDecodeToBgra(path, out width, out height, maxDimension, lowQuality);
+    }
+
+    // ─── GDI+ fallback (original path) ────────────────────────────────
+
+    static byte[] GdiDecodeToBgra(string path, out int width, out int height,
+                                  int maxDimension, bool lowQuality)
     {
         using var original = new Bitmap(path);
         Bitmap bmp = original;
@@ -62,8 +92,8 @@ static unsafe class ImageDecoder
             bmp = new Bitmap(original);
             ownsBmp = true;
         }
-        // else: LockBits converts 24/32bpp sources to 32bppArgb in place, so the
-        // previous unconditional "new Bitmap(original)" full-image copy is avoided.
+        // else: LockBits converts 24/32bpp sources to 32bppArgb in place, so no
+        // extra full-image copy is needed.
 
         try
         {

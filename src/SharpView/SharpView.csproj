@@ -23,6 +23,8 @@
     <PackageReference Include="Vortice.DXGI" Version="3.8.2" />
     <PackageReference Include="Vortice.D3DCompiler" Version="3.8.2" />
     <PackageReference Include="Vortice.DirectX" Version="3.8.2" />
+    <!-- Vortice.Direct2D1 ships the Vortice.WIC bindings used by WicDecoder. -->
+    <PackageReference Include="Vortice.Direct2D1" Version="3.8.2" />
     <PackageReference Include="Vortice.Mathematics" Version="2.1.0" />
   </ItemGroup>
 
