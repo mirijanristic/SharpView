@@ -38,6 +38,11 @@ sealed class ViewerApp : IDisposable
     // Render a few extra frames after any event so the final state reaches the screen.
     int _forcedFrames = 3;
 
+    // The very first image gets an instant (non-animated) fit; also guards the
+    // one-time "cannot open" warning if the initial decode fails.
+    bool _firstImageShown;
+    bool _initialFailureReported;
+
     readonly string _initialImagePath;
 
     public ViewerApp(string imagePath)
@@ -95,18 +100,18 @@ sealed class ViewerApp : IDisposable
 
     void InitGraphics()
     {
+        // Start decoding the very first image immediately, on the thread pool —
+        // it overlaps the D3D12 initialization below, and the window shows the
+        // moment it is ready instead of freezing for seconds on a huge file.
+        // The picture pops in (with an instant fit) as soon as the decode lands.
+        _imageRenderer = new ImageRenderer(_res);
+        _imageRenderer.LoadImageAsync(_initialImagePath);
+
         _res.Init(_form.Handle, _width, _height);
         WindowStyling.ApplyDarkStyle(_form.Handle); // dark title bar + Mica caption
 
-        _imageRenderer = new ImageRenderer(_res);
         _thumbCache = new ThumbnailCache(_res);
         _thumbStrip = new ThumbnailStrip(_res, _thumbCache);
-
-        // Decode the initial image synchronously; the GPU upload itself is recorded
-        // into the first frame's command list. The startup zoom (true 1:1 when the
-        // image fits, fit-to-window when it is bigger) is applied in Run(), once
-        // the maximized client size is actually known.
-        _imageRenderer.LoadImageSync(_initialImagePath);
 
         _nav.ScanFolder(_initialImagePath);
         PrefetchNeighbors(); // next/prev are pre-decoded before the user asks
@@ -120,11 +125,10 @@ sealed class ViewerApp : IDisposable
         _form.Show();
 
         // The window opens maximized, so the real client size is only known now:
-        // sync the swap chain to it and apply the startup view (1:1 when the image
-        // fits, fit-to-window when it is bigger) before the first frame.
+        // sync the swap chain to it and center the strip. The startup view for the
+        // image itself is applied in Update() the moment its (async) decode lands.
         _needsResize = false;
         HandleResize();
-        _imageRenderer.FitOrOneToOneInstant(_width, MainViewHeight);
         _thumbStrip.SnapToIndex(_nav.CurrentIndex, _width);
 
         _lastFrameTime = _clock.Elapsed.TotalSeconds;
@@ -166,7 +170,8 @@ sealed class ViewerApp : IDisposable
         || !_imageRenderer.IsAnimationSettled
         || !_thumbStrip.IsSettled
         || _imageRenderer.IsBusy
-        || _thumbCache.IsBusy;
+        || _thumbCache.IsBusy
+        || (!_firstImageShown && !_initialFailureReported); // initial load still resolving
 
     /// <summary>Ensure the render loop runs for at least a couple more frames.</summary>
     void Wake() => _forcedFrames = Math.Max(_forcedFrames, 2);
@@ -178,10 +183,31 @@ sealed class ViewerApp : IDisposable
         _lastFrameTime = now;
 
         // A newly decoded main image? Publish its dimensions and set the view:
-        // 1:1 when it fits, fit-to-window when it is bigger (same as startup).
-        // Prefer the old always-fit behavior? Revert this line to FitToWindow.
+        // 1:1 when it fits, fit-to-window when it is bigger. The very first image
+        // appears instantly (no zoom animation); navigation stays animated.
+        // Prefer the old always-fit behavior? Swap FitOrOneToOne for FitToWindow.
         if (_imageRenderer.PollDecodedImage())
-            _imageRenderer.FitOrOneToOne(_width, MainViewHeight);
+        {
+            if (_firstImageShown)
+            {
+                _imageRenderer.FitOrOneToOne(_width, MainViewHeight);
+            }
+            else
+            {
+                _imageRenderer.FitOrOneToOneInstant(_width, MainViewHeight);
+                _firstImageShown = true;
+            }
+        }
+        else if (!_firstImageShown && !_initialFailureReported
+                 && !_imageRenderer.IsBusy && !_imageRenderer.HasImage)
+        {
+            // The initial decode failed (corrupt/unsupported file). Report once and
+            // keep running — the rest of the folder stays browsable via the strip.
+            _initialFailureReported = true;
+            MessageBox.Show(_form,
+                $"Cannot open image:\n{_initialImagePath}",
+                "SharpView", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+        }
 
         _imageRenderer.Update(dt, _width, MainViewHeight);
         _thumbStrip.Update(dt, _width, _height, _nav);

@@ -128,16 +128,6 @@ sealed class ImageRenderer : IDisposable
         });
     }
 
-    /// <summary>Synchronous decode — used only for the initial image at startup.
-    /// Dimensions are published immediately; the upload happens on the first frame.</summary>
-    public void LoadImageSync(string path)
-    {
-        int generation = Interlocked.Increment(ref _loadGeneration);
-        byte[] pixels = ImageDecoder.DecodeToBgra(path, out int w, out int h);
-        _pendingImages.Enqueue(new DecodedImage(w, h, pixels, generation));
-        PollDecodedImage();
-    }
-
     /// <summary>
     /// Decode <paramref name="path"/> in the background and keep the pixels in a small
     /// bounded CPU cache so a later <see cref="LoadImageAsync"/> for it is instant.
