@@ -5,6 +5,7 @@ using Vortice.D3DCompiler;
 using Vortice.Direct3D;
 using Vortice.Direct3D12;
 using Vortice.Direct3D12.Debug;
+using Vortice.DirectComposition;
 using Vortice.DXGI;
 using Vortice.Mathematics;
 using Format = Vortice.DXGI.Format;
@@ -14,6 +15,9 @@ namespace SharpView.Core;
 /// <summary>
 /// Manages all Direct3D 12 device resources: device, swap chain, command infrastructure,
 /// pipeline state, descriptor heaps, vertex buffer, and constant buffer.
+/// Presentation is windowless: a composition swap chain (premultiplied alpha) hosted in
+/// a DirectComposition visual tree, so DWM blends every rendered pixel with the desktop
+/// behind the window — this is what makes the translucent Picasa-style backdrop possible.
 /// </summary>
 /// <remarks>
 /// Threading model: all members must be called from the render thread unless noted otherwise.
@@ -28,6 +32,10 @@ sealed unsafe class DeviceResources : IDisposable
     /// 32bpp memory layout, so decoded pixels are uploaded with straight memcpy —
     /// no per-pixel channel swizzle on the CPU.</summary>
     public const Format TextureFormat = Format.B8G8R8A8_UNorm;
+    /// <summary>Opacity of the black veil drawn wherever no opaque content (image,
+    /// thumbnails) covers the window: 0 = that area is fully invisible, 1 = classic
+    /// solid black. The image itself always renders fully opaque on top of it.</summary>
+    public const float BackdropAlpha = 0.5f;
     public const int MaxSrvSlots = 256;
     const int MaxCbSlots = 64;
     const int CbSlotSize = 256; // constant buffer views must be 256-byte aligned
@@ -36,6 +44,14 @@ sealed unsafe class DeviceResources : IDisposable
     public ID3D12Device2 Device { get; private set; } = null!;
     public ID3D12CommandQueue CommandQueue { get; private set; } = null!;
     public IDXGISwapChain3 SwapChain { get; private set; } = null!;
+
+    // DirectComposition tree that puts the composition swap chain on screen.
+    // (A flip-model hwnd swap chain is always opaque; only composition
+    // presentation carries our per-pixel alpha through to DWM.) The v1
+    // IDCompositionDevice interface is all we need: target + visual + commit.
+    IDCompositionDevice _dcompDevice = null!;
+    IDCompositionTarget _dcompTarget = null!;
+    IDCompositionVisual _dcompVisual = null!;
 
     // Frame resources
     readonly ID3D12Resource[] _renderTargets = new ID3D12Resource[FrameCount];
@@ -113,13 +129,33 @@ sealed unsafe class DeviceResources : IDisposable
             BufferUsage = Usage.RenderTargetOutput,
             SwapEffect = SwapEffect.FlipDiscard,
             SampleDescription = new SampleDescription(1, 0),
-            Flags = SwapChainFlags.AllowTearing,
+            // Composition swap chains must use Stretch scaling; Premultiplied is
+            // the alpha DWM consumes when blending the window with what is behind
+            // it. (AllowTearing is hwnd-swap-chain-only and was unused anyway —
+            // we present with vsync.)
+            Scaling = Scaling.Stretch,
+            AlphaMode = AlphaMode.Premultiplied,
         };
 
-        using var tmp = factory.CreateSwapChainForHwnd(CommandQueue, hwnd, sd);
-        factory.MakeWindowAssociation(hwnd, WindowAssociationFlags.IgnoreAltEnter);
+        // Windowless presentation: the swap chain is not bound to the HWND but
+        // handed to DWM through a minimal DirectComposition tree
+        // (device → hwnd target → root visual → swap chain content).
+        using var tmp = factory.CreateSwapChainForComposition(CommandQueue, sd, null);
         SwapChain = tmp.QueryInterface<IDXGISwapChain3>();
         _frameIndex = (int)SwapChain.CurrentBackBufferIndex;
+
+        // renderingDevice stays null on purpose: D3D12 exposes no IDXGIDevice, and
+        // none is needed just to host swap chain content (no DComp surfaces here).
+        _dcompDevice = DComp.DCompositionCreateDevice2<IDCompositionDevice>(null!);
+        // topmost=false: composed behind any child windows (we have none — all UI
+        // is drawn through D3D because WS_EX_NOREDIRECTIONBITMAP removes the GDI
+        // surface child controls would paint into).
+        _dcompDevice.CreateTargetForHwnd(hwnd, false, out IDCompositionTarget target).CheckError();
+        _dcompTarget = target;
+        _dcompVisual = _dcompDevice.CreateVisual();
+        _dcompVisual.SetContent(SwapChain).CheckError();
+        _dcompTarget.SetRoot(_dcompVisual).CheckError();
+        _dcompDevice.Commit().CheckError();
 
         // RTV heap
         _rtvHeap = Device.CreateDescriptorHeap(new DescriptorHeapDescription(
@@ -221,10 +257,15 @@ sealed unsafe class DeviceResources : IDisposable
             InputLayout = new InputLayoutDescription(inputLayout),
             PrimitiveTopologyType = PrimitiveTopologyType.Triangle,
             RasterizerState = RasterizerDescription.CullNone,
-            // Opaque, not AlphaBlend: the shader always outputs alpha = 1 (images are
-            // composited onto the checkerboard inside the shader; solid tints use
-            // a = 1), so blending only cost ROP bandwidth without changing any pixel.
-            BlendState = BlendDescription.Opaque,
+            // Premultiplied alpha over the translucent backdrop:
+            //   rgb' = src.rgb + dst.rgb * (1 - src.a)   (shader outputs premultiplied)
+            //   a'   = src.a   + dst.a   * (1 - src.a)
+            // The alpha equation matters now: DWM reads the swap chain's alpha to
+            // blend the window with the desktop behind it, so every draw must
+            // leave a correct alpha value in the render target.
+            BlendState = new BlendDescription(
+                Blend.One, Blend.InverseSourceAlpha,
+                Blend.One, Blend.InverseSourceAlpha),
             DepthStencilState = DepthStencilDescription.None,
             SampleMask = uint.MaxValue,
             RenderTargetFormats = new[] { BackBufferFormat },
@@ -425,7 +466,9 @@ sealed unsafe class DeviceResources : IDisposable
 
         var rtv = _rtvHeap.GetCPUDescriptorHandleForHeapStart() + _frameIndex * _rtvDescSize;
         _cmdList.OMSetRenderTargets(rtv);
-        _cmdList.ClearRenderTargetView(rtv, new Color4(0.07f, 0.07f, 0.07f, 1f));
+        // Premultiplied translucent black (black is (0,0,0) at any alpha): every
+        // pixel not covered by opaque draws lets the desktop show through.
+        _cmdList.ClearRenderTargetView(rtv, new Color4(0f, 0f, 0f, BackdropAlpha));
 
         _cmdList.SetGraphicsRootSignature(RootSignature);
         _cmdList.SetDescriptorHeaps(1, new[] { _srvHeap });
@@ -479,7 +522,7 @@ sealed unsafe class DeviceResources : IDisposable
         { _renderTargets[i]?.Dispose(); _renderTargets[i] = null!; }
 
         SwapChain.ResizeBuffers(FrameCount, (uint)width, (uint)height,
-            BackBufferFormat, SwapChainFlags.AllowTearing);
+            BackBufferFormat, SwapChainFlags.None);
         _frameIndex = (int)SwapChain.CurrentBackBufferIndex;
         CreateRenderTargets();
     }
@@ -520,6 +563,10 @@ sealed unsafe class DeviceResources : IDisposable
         _fenceEvent?.Dispose();
         _srvHeap?.Dispose();
         _rtvHeap?.Dispose();
+        // DComp tree first — the visual holds a reference to the swap chain.
+        _dcompVisual?.Dispose();
+        _dcompTarget?.Dispose();
+        _dcompDevice?.Dispose();
         SwapChain?.Dispose();
         CommandQueue?.Dispose();
         Device?.Dispose();

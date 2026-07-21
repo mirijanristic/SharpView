@@ -18,7 +18,6 @@ namespace SharpView;
 sealed class ViewerApp : IDisposable
 {
     readonly ViewerForm _form;
-    readonly Button _btnOneToOne;
     int _width, _height;
 
     readonly Core.DeviceResources _res = new();
@@ -54,10 +53,15 @@ sealed class ViewerApp : IDisposable
         _form = new ViewerForm
         {
             Text = $"SharpView — {Path.GetFileName(imagePath)}",
+            // Borderless overlay, Picasa-style: the whole screen is the viewer and
+            // the desktop stays visible through the translucent backdrop. Esc or
+            // Alt+F4 closes. Prefer a normal framed window again? Delete this line
+            // (it is set before ClientSize on purpose, so ClientSize is preserved).
+            FormBorderStyle = FormBorderStyle.None,
             ClientSize = new Size(_width, _height), // restored (un-maximized) size
             StartPosition = FormStartPosition.CenterScreen,
             WindowState = FormWindowState.Maximized, // start full screen
-            BackColor = Color.FromArgb(18, 18, 18),
+            BackColor = Color.FromArgb(18, 18, 18), // never visible (no GDI surface); kept for a framed fallback
             KeyPreview = true,
         };
 
@@ -67,24 +71,10 @@ sealed class ViewerApp : IDisposable
         try { _form.Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath); }
         catch { /* missing/odd icon resource — keep the default form icon */ }
 
-        _btnOneToOne = new Button
-        {
-            Text = "1:1",
-            Size = new Size(50, 32),
-            Location = new Point(10, 10),
-            BackColor = Color.FromArgb(45, 45, 48),
-            ForeColor = Color.White,
-            FlatStyle = FlatStyle.Flat,
-            Font = new Font("Segoe UI", 9F, FontStyle.Bold),
-            Cursor = Cursors.Hand,
-            TabStop = false,
-        };
-        _btnOneToOne.FlatAppearance.BorderColor = Color.FromArgb(70, 70, 74);
-        _btnOneToOne.FlatAppearance.MouseOverBackColor = Color.FromArgb(62, 62, 66);
-        _btnOneToOne.FlatAppearance.MouseDownBackColor = Color.FromArgb(80, 80, 84);
-        _btnOneToOne.Click += (_, _) => { _imageRenderer?.SetOneToOne(); Wake(); };
-
-        _form.Controls.Add(_btnOneToOne);
+        // The old WinForms "1:1" button is gone on purpose: WS_EX_NOREDIRECTIONBITMAP
+        // removes the window's GDI surface, so a classic child control would be
+        // invisible yet still swallow clicks. 1:1 stays available on double-click
+        // and the '1' key ('0' returns to fit).
 
         _form.Resize += (_, _) => { _needsResize = true; Wake(); };
         _form.FormClosing += (_, _) => _running = false;
@@ -108,7 +98,7 @@ sealed class ViewerApp : IDisposable
         _imageRenderer.LoadImageAsync(_initialImagePath);
 
         _res.Init(_form.Handle, _width, _height);
-        WindowStyling.ApplyDarkStyle(_form.Handle); // dark title bar + Mica caption
+        WindowStyling.ApplyDarkStyle(_form.Handle); // no-op while borderless; kept for a framed fallback
 
         _thumbCache = new ThumbnailCache(_res);
         _thumbStrip = new ThumbnailStrip(_res, _thumbCache);

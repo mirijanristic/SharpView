@@ -31,7 +31,9 @@ sealed class ThumbnailStrip
     public bool IsSettled => _scrollOffset == _targetScrollOffset;
 
     static readonly Vector4 SelectionColor = new(0.0f, 0.47f, 0.83f, 1.0f); // #0078D4
-    static readonly Vector4 StripBgColor = new(0.10f, 0.10f, 0.10f, 1.0f);
+    // Translucent: the strip reads as a glassy bar with the desktop shimmering
+    // through (the shader premultiplies alpha). Set a back to 1 for a solid bar.
+    static readonly Vector4 StripBgColor = new(0.06f, 0.06f, 0.06f, 0.55f);
 
     // Constant buffer slot layout (slot 0 belongs to ImageRenderer):
     //   1        strip background
