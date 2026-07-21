@@ -9,13 +9,15 @@ namespace SharpView.Rendering;
 
 /// <summary>
 /// Renders the main image view with zoom, pan, and smooth animation.
-/// Image decode happens on a background thread to avoid stalling the render loop.
+/// Image decode happens on a background thread; the GPU upload is recorded directly
+/// into the frame's command list, so navigation never blocks on the GPU.
+/// A small bounded CPU-side prefetch cache keeps the neighboring images pre-decoded,
+/// which makes next/previous navigation effectively instant.
 /// </summary>
 sealed class ImageRenderer : IDisposable
 {
     readonly DeviceResources _res;
     readonly ZoomPanController _view = new();
-    readonly ID3D12CommandAllocator _uploadAllocator;
 
     ID3D12Resource? _texture;
     int _srvSlot = -1;
@@ -26,34 +28,62 @@ sealed class ImageRenderer : IDisposable
     // Async loading: stale decodes are identified by generation and dropped.
     readonly ConcurrentQueue<DecodedImage> _pendingImages = new();
     int _loadGeneration;
+    int _decodesInFlight;            // user-requested decodes only (prefetch excluded)
+    byte[]? _pendingUploadPixels;    // picked up by FlushPendingUpload on the render thread
 
     sealed record DecodedImage(int Width, int Height, byte[] Pixels, int Generation);
 
+    // ── Prefetch cache: decoded neighbor images kept in CPU memory ──
+    const int PrefetchMaxEntries = 4;
+    const long PrefetchMaxBytes = 512L * 1024 * 1024;
+    readonly object _prefetchLock = new();
+    readonly Dictionary<string, DecodedImage> _prefetched = new(StringComparer.OrdinalIgnoreCase);
+    readonly LinkedList<string> _prefetchOrder = new(); // most-recent first
+    readonly HashSet<string> _prefetchInFlight = new(StringComparer.OrdinalIgnoreCase);
+    long _prefetchBytes;
+
     public int TextureWidth => _texW;
     public int TextureHeight => _texH;
-    public bool HasImage => _texture is not null;
+    public bool HasImage => _texW > 0;
     public bool IsOneToOne => _view.IsOneToOne;
 
-    public ImageRenderer(DeviceResources res)
-    {
-        _res = res;
-        _uploadAllocator = res.Device.CreateCommandAllocator(CommandListType.Direct);
-    }
+    /// <summary>True while a decode or GPU upload for the main image is outstanding.
+    /// The render loop keeps running while this is true so the image appears promptly.</summary>
+    public bool IsBusy =>
+        Volatile.Read(ref _decodesInFlight) > 0
+        || !_pendingImages.IsEmpty
+        || _pendingUploadPixels is not null;
+
+    /// <summary>True when the zoom/pan animation has reached its targets.</summary>
+    public bool IsAnimationSettled => _view.IsSettled;
+
+    public ImageRenderer(DeviceResources res) => _res = res;
 
     /// <summary>
     /// Kick off an async image decode. Does NOT block. The image appears on a
-    /// subsequent frame once <see cref="TryCompletePendingLoad"/> picks it up.
-    /// If called again before the previous decode finishes, the old one is discarded.
+    /// subsequent frame once <see cref="PollDecodedImage"/> picks it up. If the path
+    /// was prefetched, the decode is skipped entirely and the image is ready for the
+    /// very next frame. If called again before the previous decode finishes, the old
+    /// one is discarded.
     /// </summary>
     public void LoadImageAsync(string path)
     {
         int generation = Interlocked.Increment(ref _loadGeneration);
 
+        // Prefetched? No decode needed.
+        DecodedImage? cached = TakePrefetched(path);
+        if (cached is not null)
+        {
+            _pendingImages.Enqueue(cached with { Generation = generation });
+            return;
+        }
+
+        Interlocked.Increment(ref _decodesInFlight);
         ThreadPool.QueueUserWorkItem(_ =>
         {
             try
             {
-                byte[] pixels = ImageDecoder.DecodeToRgba(path, out int w, out int h);
+                byte[] pixels = ImageDecoder.DecodeToBgra(path, out int w, out int h);
                 // Only enqueue if this is still the latest request.
                 if (Volatile.Read(ref _loadGeneration) == generation)
                     _pendingImages.Enqueue(new DecodedImage(w, h, pixels, generation));
@@ -62,22 +92,99 @@ sealed class ImageRenderer : IDisposable
             {
                 Debug.WriteLine($"[ImageRenderer] Failed to decode '{path}': {ex.Message}");
             }
+            finally
+            {
+                Interlocked.Decrement(ref _decodesInFlight);
+            }
         });
     }
 
-    /// <summary>Synchronous load — used only for the initial image at startup.</summary>
+    /// <summary>Synchronous decode — used only for the initial image at startup.
+    /// Dimensions are published immediately; the upload happens on the first frame.</summary>
     public void LoadImageSync(string path)
     {
-        Interlocked.Increment(ref _loadGeneration);
-        byte[] pixels = ImageDecoder.DecodeToRgba(path, out int w, out int h);
-        UploadToGpu(w, h, pixels);
+        int generation = Interlocked.Increment(ref _loadGeneration);
+        byte[] pixels = ImageDecoder.DecodeToBgra(path, out int w, out int h);
+        _pendingImages.Enqueue(new DecodedImage(w, h, pixels, generation));
+        PollDecodedImage();
     }
 
     /// <summary>
-    /// Call each frame before rendering. Uploads the latest decoded image to the GPU
-    /// if one is ready. Returns true if a new image was loaded (caller may want to fit).
+    /// Decode <paramref name="path"/> in the background and keep the pixels in a small
+    /// bounded CPU cache so a later <see cref="LoadImageAsync"/> for it is instant.
+    /// Safe to call repeatedly; already-cached and in-flight paths are ignored.
     /// </summary>
-    public bool TryCompletePendingLoad()
+    public void Prefetch(string path)
+    {
+        if (string.IsNullOrEmpty(path)) return;
+
+        lock (_prefetchLock)
+        {
+            if (_prefetched.ContainsKey(path) || !_prefetchInFlight.Add(path))
+                return;
+        }
+
+        ThreadPool.QueueUserWorkItem(_ =>
+        {
+            try
+            {
+                byte[] pixels = ImageDecoder.DecodeToBgra(path, out int w, out int h);
+                StorePrefetched(path, new DecodedImage(w, h, pixels, 0));
+            }
+            catch
+            {
+                // Corrupt/unsupported file — a real load attempt will surface the error.
+            }
+            finally
+            {
+                lock (_prefetchLock) _prefetchInFlight.Remove(path);
+            }
+        });
+    }
+
+    void StorePrefetched(string path, DecodedImage img)
+    {
+        long size = img.Pixels.LongLength;
+        if (size > PrefetchMaxBytes) return; // larger than the entire budget — skip
+
+        lock (_prefetchLock)
+        {
+            if (_prefetched.ContainsKey(path)) return;
+
+            _prefetched[path] = img;
+            _prefetchOrder.AddFirst(path);
+            _prefetchBytes += size;
+
+            // Evict oldest entries beyond the entry/byte budget.
+            while ((_prefetched.Count > PrefetchMaxEntries || _prefetchBytes > PrefetchMaxBytes)
+                   && _prefetchOrder.Last is not null)
+            {
+                string oldest = _prefetchOrder.Last.Value;
+                _prefetchOrder.RemoveLast();
+                if (_prefetched.Remove(oldest, out var evicted))
+                    _prefetchBytes -= evicted.Pixels.LongLength;
+            }
+        }
+    }
+
+    DecodedImage? TakePrefetched(string path)
+    {
+        lock (_prefetchLock)
+        {
+            if (!_prefetched.Remove(path, out var img)) return null;
+            _prefetchOrder.Remove(path); // O(n) with n ≤ PrefetchMaxEntries
+            _prefetchBytes -= img.Pixels.LongLength;
+            return img;
+        }
+    }
+
+    /// <summary>
+    /// Pick up the newest finished decode (CPU side only). Returns true if a new image
+    /// arrived: dimensions are updated immediately so the caller can re-fit the view;
+    /// the actual GPU upload is recorded by <see cref="FlushPendingUpload"/> during
+    /// the next frame.
+    /// </summary>
+    public bool PollDecodedImage()
     {
         DecodedImage? latest = null;
         int currentGeneration = Volatile.Read(ref _loadGeneration);
@@ -91,35 +198,33 @@ sealed class ImageRenderer : IDisposable
 
         if (latest is null) return false;
 
-        UploadToGpu(latest.Width, latest.Height, latest.Pixels);
+        _texW = latest.Width;
+        _texH = latest.Height;
+        _pendingUploadPixels = latest.Pixels;
         return true;
     }
 
-    void UploadToGpu(int width, int height, byte[] pixels)
+    /// <summary>
+    /// Record the pending texture upload into the frame's command list (render thread,
+    /// between BeginFrame and the draws). The copy + barrier execute before any draw
+    /// recorded afterwards, so no GPU wait is needed. The previous texture and its SRV
+    /// slot are released via fence-tagged deferral once no in-flight frame can
+    /// reference them anymore.
+    /// </summary>
+    public void FlushPendingUpload(ID3D12GraphicsCommandList cmdList)
     {
-        // Release the previous texture only after the GPU is done with it.
+        if (_pendingUploadPixels is null) return;
+
         if (_texture is not null)
         {
-            _res.WaitForGpu();
-            _texture.Dispose();
+            _res.DeferRelease(_texture, _srvSlot);
             _texture = null;
-            if (_srvSlot >= 0)
-            {
-                _res.FreeSrvSlot(_srvSlot);
-                _srvSlot = -1;
-            }
+            _srvSlot = -1;
         }
 
-        _texW = width;
-        _texH = height;
         _srvSlot = _res.AllocateSrvSlot();
-
-        _uploadAllocator.Reset();
-        _res.CommandList.Reset(_uploadAllocator, null);
-        _texture = TextureUploader.Upload(_res, width, height, pixels, _srvSlot, _res.CommandList);
-        _res.CommandList.Close();
-        _res.CommandQueue.ExecuteCommandList(_res.CommandList);
-        _res.WaitForGpu(); // also releases the deferred staging buffer
+        _texture = TextureUploader.Upload(_res, _texW, _texH, _pendingUploadPixels, _srvSlot, cmdList);
+        _pendingUploadPixels = null;
     }
 
     /// <summary>Update the smooth animation and write this frame's constants. Call each frame.</summary>
@@ -155,7 +260,7 @@ sealed class ImageRenderer : IDisposable
     /// <summary>Issue the draw call. The viewport must be set by the caller.</summary>
     public void Render()
     {
-        if (!HasImage) return;
+        if (_texture is null) return;
         _res.DrawQuad(_srvSlot, CbSlot);
     }
 
@@ -187,7 +292,6 @@ sealed class ImageRenderer : IDisposable
     {
         // ViewerApp performs a full GPU wait before disposing renderers.
         _texture?.Dispose();
-        _uploadAllocator.Dispose();
         if (_srvSlot >= 0)
         {
             _res.FreeSrvSlot(_srvSlot);

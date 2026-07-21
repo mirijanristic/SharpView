@@ -9,11 +9,12 @@ namespace SharpView.Core;
 static unsafe class TextureUploader
 {
     /// <summary>
-    /// Uploads decoded RGBA pixels to a new GPU texture. Must be called on the render
-    /// thread with <paramref name="cmdList"/> in the recording state. The caller must
-    /// execute the command list and call <see cref="DeviceResources.WaitForGpu"/> before
-    /// the texture is sampled; that same call also releases the staging upload buffer,
-    /// which this method schedules via <see cref="DeviceResources.DeferDisposal"/>.
+    /// Uploads decoded 32bpp BGRA pixels to a new GPU texture. Must be called on the
+    /// render thread with <paramref name="cmdList"/> in the recording state. No GPU
+    /// wait is required: draws recorded after the copy in the same command list (or in
+    /// later lists on the same queue) are guaranteed to see the finished texture, and
+    /// the staging buffer is released via <see cref="DeviceResources.DeferRelease"/>
+    /// once the next fence signal completes.
     /// </summary>
     public static ID3D12Resource Upload(
         DeviceResources res,
@@ -24,7 +25,7 @@ static unsafe class TextureUploader
         int rowPitch = width * 4;
 
         var texDesc = ResourceDescription.Texture2D(
-            DeviceResources.BackBufferFormat, (uint)width, (uint)height, 1, 1);
+            DeviceResources.TextureFormat, (uint)width, (uint)height, 1, 1);
 
         var texture = res.Device.CreateCommittedResource(
             new HeapProperties(HeapType.Default), HeapFlags.None,
@@ -47,12 +48,21 @@ static unsafe class TextureUploader
 
         fixed (byte* srcPtr = pixels)
         {
-            for (int y = 0; y < height; y++)
+            uint gpuRowPitch = footprint.Footprint.RowPitch;
+            if (gpuRowPitch == (uint)rowPitch)
             {
-                Unsafe.CopyBlock(
-                    dstPtr + y * (long)footprint.Footprint.RowPitch,
-                    srcPtr + y * rowPitch,
-                    (uint)rowPitch);
+                // Tightly packed on both sides (width multiple of 64 px) — one big copy.
+                Unsafe.CopyBlock(dstPtr, srcPtr, (uint)(rowPitch * height));
+            }
+            else
+            {
+                for (int y = 0; y < height; y++)
+                {
+                    Unsafe.CopyBlock(
+                        dstPtr + y * (long)gpuRowPitch,
+                        srcPtr + y * (long)rowPitch,
+                        (uint)rowPitch);
+                }
             }
         }
         uploadBuf.Unmap(0u);
@@ -64,13 +74,13 @@ static unsafe class TextureUploader
             ResourceStates.CopyDest, ResourceStates.PixelShaderResource);
 
         // The staging buffer must outlive the command list execution.
-        // DeviceResources releases it after the next full GPU sync.
-        res.DeferDisposal(uploadBuf);
+        // DeviceResources releases it once the next fence signal completes (no stall).
+        res.DeferRelease(uploadBuf);
 
         res.Device.CreateShaderResourceView(texture,
             new ShaderResourceViewDescription
             {
-                Format = DeviceResources.BackBufferFormat,
+                Format = DeviceResources.TextureFormat,
                 ViewDimension = Vortice.Direct3D12.ShaderResourceViewDimension.Texture2D,
                 Shader4ComponentMapping = ShaderComponentMapping.Default,
                 Texture2D = new Texture2DShaderResourceView { MipLevels = 1 },

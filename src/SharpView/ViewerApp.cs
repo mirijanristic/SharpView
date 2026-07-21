@@ -1,4 +1,4 @@
-using Vortice.Direct3D12;
+using System.Diagnostics;
 using SharpView.Rendering;
 using SharpView.Services;
 
@@ -10,6 +10,9 @@ namespace SharpView;
 
 /// <summary>
 /// Main application class. Creates the form, manages input, and runs the render loop.
+/// The loop is demand-driven: when nothing is animating, loading, or being dragged,
+/// it sleeps briefly instead of redrawing a static image, so idle CPU/GPU usage
+/// drops to (near) zero.
 /// </summary>
 sealed class ViewerApp : IDisposable
 {
@@ -26,10 +29,13 @@ sealed class ViewerApp : IDisposable
     bool _running = true, _needsResize;
     bool _dragging;
     Point _lastMouse;
-    DateTime _lastFrameTime = DateTime.UtcNow;
 
-    // Upload command allocator for thumbnail uploads (separate from frame allocators)
-    ID3D12CommandAllocator _uploadAllocator = null!;
+    // High-resolution frame timing (DateTime.UtcNow is low-resolution and slower).
+    readonly Stopwatch _clock = Stopwatch.StartNew();
+    double _lastFrameTime;
+
+    // Render a few extra frames after any event so the final state reaches the screen.
+    int _forcedFrames = 3;
 
     readonly string _initialImagePath;
 
@@ -63,11 +69,11 @@ sealed class ViewerApp : IDisposable
         _btnOneToOne.FlatAppearance.BorderColor = Color.FromArgb(70, 70, 74);
         _btnOneToOne.FlatAppearance.MouseOverBackColor = Color.FromArgb(62, 62, 66);
         _btnOneToOne.FlatAppearance.MouseDownBackColor = Color.FromArgb(80, 80, 84);
-        _btnOneToOne.Click += (_, _) => _imageRenderer?.SetOneToOne();
+        _btnOneToOne.Click += (_, _) => { _imageRenderer?.SetOneToOne(); Wake(); };
 
         _form.Controls.Add(_btnOneToOne);
 
-        _form.Resize += (_, _) => _needsResize = true;
+        _form.Resize += (_, _) => { _needsResize = true; Wake(); };
         _form.FormClosing += (_, _) => _running = false;
         _form.MouseWheel += OnMouseWheel;
         _form.MouseDown += OnMouseDown;
@@ -82,18 +88,19 @@ sealed class ViewerApp : IDisposable
     void InitGraphics()
     {
         _res.Init(_form.Handle, _width, _height);
-        _uploadAllocator = _res.Device.CreateCommandAllocator(CommandListType.Direct);
 
         _imageRenderer = new ImageRenderer(_res);
         _thumbCache = new ThumbnailCache(_res);
         _thumbStrip = new ThumbnailStrip(_res, _thumbCache);
 
-        // Load the initial image synchronously; no animation on first show.
+        // Decode the initial image synchronously; the GPU upload itself is recorded
+        // into the first frame's command list. No animation on first show.
         _imageRenderer.LoadImageSync(_initialImagePath);
         _imageRenderer.FitToWindowInstant(_width, MainViewHeight);
 
         _nav.ScanFolder(_initialImagePath);
         _thumbStrip.SnapToIndex(_nav.CurrentIndex, _width);
+        PrefetchNeighbors(); // next/prev are pre-decoded before the user asks
         UpdateTitle();
     }
 
@@ -102,7 +109,7 @@ sealed class ViewerApp : IDisposable
     public void Run()
     {
         _form.Show();
-        _lastFrameTime = DateTime.UtcNow;
+        _lastFrameTime = _clock.Elapsed.TotalSeconds;
 
         while (_running && _form.Visible)
         {
@@ -113,18 +120,49 @@ sealed class ViewerApp : IDisposable
             {
                 HandleResize();
                 _needsResize = false;
+                Wake();
             }
+
+            if (!NeedsFrame())
+            {
+                // Fully idle: static image on screen, nothing decoding or animating.
+                // Sleep briefly instead of spinning at vsync — input is still polled
+                // every few milliseconds by DoEvents above.
+                Thread.Sleep(4);
+                _lastFrameTime = _clock.Elapsed.TotalSeconds;
+                continue;
+            }
+
+            if (_forcedFrames > 0) _forcedFrames--;
 
             Update();
             RenderFrame();
         }
     }
 
+    /// <summary>True when something on screen can still change and a frame must be drawn.</summary>
+    bool NeedsFrame() =>
+        _forcedFrames > 0
+        || _dragging
+        || _needsResize
+        || !_imageRenderer.IsAnimationSettled
+        || !_thumbStrip.IsSettled
+        || _imageRenderer.IsBusy
+        || _thumbCache.IsBusy;
+
+    /// <summary>Ensure the render loop runs for at least a couple more frames.</summary>
+    void Wake() => _forcedFrames = Math.Max(_forcedFrames, 2);
+
     void Update()
     {
-        var now = DateTime.UtcNow;
-        float dt = Math.Clamp((float)(now - _lastFrameTime).TotalSeconds, 0.0001f, 0.1f);
+        double now = _clock.Elapsed.TotalSeconds;
+        float dt = Math.Clamp((float)(now - _lastFrameTime), 0.0001f, 0.1f);
         _lastFrameTime = now;
+
+        // A newly decoded main image? Publish its dimensions and re-fit the view;
+        // the GPU upload itself is recorded in RenderFrame.
+        if (_imageRenderer.PollDecodedImage())
+            _imageRenderer.FitToWindow(_width, MainViewHeight);
 
         _imageRenderer.Update(dt, _width, MainViewHeight);
         _thumbStrip.Update(dt, _width, _height, _nav);
@@ -132,26 +170,16 @@ sealed class ViewerApp : IDisposable
 
     void RenderFrame()
     {
-        // A newly decoded main image? Upload it and fit the view.
-        if (_imageRenderer.TryCompletePendingLoad())
-            _imageRenderer.FitToWindow(_width, MainViewHeight);
-
-        // Upload any freshly decoded thumbnails before beginning the frame.
-        if (_thumbCache.HasPendingUploads)
-        {
-            _uploadAllocator.Reset();
-            _res.CommandList.Reset(_uploadAllocator, null);
-            bool uploaded = _thumbCache.ProcessUploads(_res.CommandList);
-            _res.CommandList.Close();
-
-            if (uploaded)
-            {
-                _res.CommandQueue.ExecuteCommandList(_res.CommandList);
-                _res.WaitForGpu(); // also releases staging upload buffers
-            }
-        }
-
         _res.BeginFrame();
+
+        // Record pending texture uploads into this frame's command list. They execute
+        // (with their barriers) before the draws below — same-queue ordering makes a
+        // GPU wait unnecessary, and staging buffers are reclaimed once this frame's
+        // fence completes. This removed the full pipeline stalls the old separate
+        // upload path required on every image change and thumbnail batch.
+        _imageRenderer.FlushPendingUpload(_res.CommandList);
+        if (_thumbCache.HasPendingUploads)
+            _thumbCache.ProcessUploads(_res.CommandList);
 
         // Main image (top area)
         _res.SetViewportAndScissor(0, 0, _width, MainViewHeight);
@@ -176,9 +204,20 @@ sealed class ViewerApp : IDisposable
 
     void NavigateToImage()
     {
-        // Non-blocking: decode happens on the thread pool, upload on a later frame.
+        // Non-blocking: decode happens on the thread pool (or is skipped entirely
+        // when the image was prefetched), the upload on a later frame.
         _imageRenderer.LoadImageAsync(_nav.CurrentFile);
+        PrefetchNeighbors();
         UpdateTitle();
+        Wake();
+    }
+
+    /// <summary>Pre-decode the previous/next images so arrow-key navigation is instant.</summary>
+    void PrefetchNeighbors()
+    {
+        int i = _nav.CurrentIndex;
+        if (i + 1 < _nav.Count) _imageRenderer.Prefetch(_nav.Files[i + 1]);
+        if (i - 1 >= 0) _imageRenderer.Prefetch(_nav.Files[i - 1]);
     }
 
     void UpdateTitle()
@@ -190,7 +229,10 @@ sealed class ViewerApp : IDisposable
     {
         // Only zoom while the cursor is over the main image area.
         if (e.Y < MainViewHeight)
+        {
             _imageRenderer.ZoomAt(e.Delta, e.X, e.Y, _width, MainViewHeight);
+            Wake();
+        }
     }
 
     void OnMouseDown(object? s, MouseEventArgs e)
@@ -212,6 +254,7 @@ sealed class ViewerApp : IDisposable
             _dragging = true;
             _lastMouse = e.Location;
             _form.Cursor = Cursors.SizeAll;
+            Wake();
         }
     }
 
@@ -221,6 +264,7 @@ sealed class ViewerApp : IDisposable
         {
             _dragging = false;
             _form.Cursor = Cursors.Default;
+            Wake();
         }
     }
 
@@ -240,9 +284,17 @@ sealed class ViewerApp : IDisposable
             _imageRenderer.SetOneToOne();
         else
             _imageRenderer.FitToWindow(_width, MainViewHeight);
+        Wake();
     }
 
     bool HandleKey(Keys keyData)
+    {
+        bool handled = HandleKeyCore(keyData);
+        if (handled) Wake();
+        return handled;
+    }
+
+    bool HandleKeyCore(Keys keyData)
     {
         switch (keyData & Keys.KeyCode) // strip Shift/Ctrl/Alt modifiers
         {
@@ -287,7 +339,6 @@ sealed class ViewerApp : IDisposable
 
         _thumbCache?.Dispose();
         _imageRenderer?.Dispose();
-        _uploadAllocator?.Dispose();
         _res.Dispose();
         _form.Dispose();
     }

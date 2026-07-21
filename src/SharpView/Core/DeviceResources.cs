@@ -24,6 +24,10 @@ sealed unsafe class DeviceResources : IDisposable
 {
     public const int FrameCount = 2;
     public const Format BackBufferFormat = Format.R8G8B8A8_UNorm;
+    /// <summary>Format of decoded image/thumbnail textures. BGRA matches GDI+'s native
+    /// 32bpp memory layout, so decoded pixels are uploaded with straight memcpy —
+    /// no per-pixel channel swizzle on the CPU.</summary>
+    public const Format TextureFormat = Format.B8G8R8A8_UNorm;
     public const int MaxSrvSlots = 256;
     const int MaxCbSlots = 64;
     const int CbSlotSize = 256; // constant buffer views must be 256-byte aligned
@@ -69,9 +73,11 @@ sealed unsafe class DeviceResources : IDisposable
     // SRV slot allocator
     readonly bool[] _srvSlotUsed = new bool[MaxSrvSlots];
 
-    // Resources that may still be referenced by in-flight GPU work.
-    // Released after the next full WaitForGpu().
-    readonly List<ID3D12Resource> _deferredDisposals = new();
+    // Resources (and SRV slots) that may still be referenced by in-flight GPU work.
+    // Each entry is tagged with the next fence value to be signaled; it is released
+    // once the GPU has passed that fence (checked in BeginFrame / WaitForGpu), so
+    // steady-state cleanup never blocks the CPU on the GPU.
+    readonly Queue<(ulong Fence, ID3D12Resource? Resource, int SrvSlot)> _deferred = new();
 
     bool _disposed;
 
@@ -357,18 +363,27 @@ sealed unsafe class DeviceResources : IDisposable
     // ─── Deferred Disposal ────────────────────────────────────────────
 
     /// <summary>
-    /// Schedule a GPU resource for disposal once the GPU is guaranteed idle.
-    /// The resource is released by the next <see cref="WaitForGpu"/> call.
-    /// Render thread only.
+    /// Schedule a GPU resource (and optionally its SRV slot) for release once the GPU
+    /// has finished all work submitted up to the next fence signal. Unlike a full
+    /// <see cref="WaitForGpu"/>, this never blocks — completed entries are reclaimed
+    /// at the start of each frame. Render thread only.
     /// </summary>
-    public void DeferDisposal(ID3D12Resource resource) => _deferredDisposals.Add(resource);
+    public void DeferRelease(ID3D12Resource? resource, int srvSlot = -1)
+        => _deferred.Enqueue((_currentFenceValue, resource, srvSlot));
 
-    void ReleaseDeferredDisposals()
+    /// <summary>Dispose deferred resources whose fence the GPU has already passed.
+    /// Fence tags are monotonically increasing, so the queue front is always the oldest.</summary>
+    void ReleaseCompleted()
     {
-        if (_deferredDisposals.Count == 0) return;
-        foreach (var resource in _deferredDisposals)
-            resource.Dispose();
-        _deferredDisposals.Clear();
+        if (_deferred.Count == 0) return;
+
+        ulong completed = _fence.CompletedValue;
+        while (_deferred.Count > 0 && _deferred.Peek().Fence <= completed)
+        {
+            var (_, resource, srvSlot) = _deferred.Dequeue();
+            resource?.Dispose();
+            if (srvSlot >= 0) FreeSrvSlot(srvSlot);
+        }
     }
 
     // ─── Constant Buffer ──────────────────────────────────────────────
@@ -394,6 +409,9 @@ sealed unsafe class DeviceResources : IDisposable
 
     public void BeginFrame()
     {
+        // Reclaim resources whose GPU work already completed — free, no stall.
+        ReleaseCompleted();
+
         var alloc = _cmdAllocators[_frameIndex];
         alloc.Reset();
         _cmdList.Reset(alloc, Pso);
@@ -464,7 +482,8 @@ sealed unsafe class DeviceResources : IDisposable
 
     /// <summary>
     /// Block until the GPU has finished all submitted work, then release
-    /// any resources scheduled via <see cref="DeferDisposal"/>.
+    /// any resources scheduled via <see cref="DeferRelease"/> (after a full wait,
+    /// every deferred entry is guaranteed complete).
     /// </summary>
     public void WaitForGpu()
     {
@@ -473,7 +492,7 @@ sealed unsafe class DeviceResources : IDisposable
         _fence.SetEventOnCompletion(v, _fenceEvent);
         _fenceEvent.WaitOne();
 
-        ReleaseDeferredDisposals();
+        ReleaseCompleted();
     }
 
     // ─── Dispose ──────────────────────────────────────────────────────

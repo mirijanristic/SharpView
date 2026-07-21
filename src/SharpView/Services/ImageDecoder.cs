@@ -1,4 +1,5 @@
 using System.Drawing.Imaging;
+using System.Runtime.CompilerServices;
 
 using GdiPixelFormat = System.Drawing.Imaging.PixelFormat;
 using GdiRectangle = System.Drawing.Rectangle;
@@ -6,21 +7,29 @@ using GdiRectangle = System.Drawing.Rectangle;
 namespace SharpView.Services;
 
 /// <summary>
-/// Decodes image files into raw RGBA pixel data using GDI+ (System.Drawing).
+/// Decodes image files into raw 32bpp BGRA pixel data using GDI+ (System.Drawing).
 /// Pure CPU work with no GPU dependencies, so it is safe to call from any thread.
 /// </summary>
+/// <remarks>
+/// BGRA is GDI+'s native 32bpp memory layout, so no per-pixel channel swizzle is
+/// needed — rows are copied with straight memcpy and uploaded into
+/// <c>B8G8R8A8_UNorm</c> textures (see <see cref="Core.DeviceResources.TextureFormat"/>).
+/// This removed the old per-pixel BGRA→RGBA loop, which dominated decode time for
+/// large images.
+/// </remarks>
 static unsafe class ImageDecoder
 {
     /// <summary>
-    /// Decodes an image file into RGBA pixel bytes. Returns dimensions via out params.
-    /// Optionally resizes to fit within <paramref name="maxDimension"/>.
+    /// Decodes an image file into tightly packed BGRA pixel bytes. Returns dimensions
+    /// via out params. Optionally resizes to fit within <paramref name="maxDimension"/>.
     /// <paramref name="lowQuality"/> uses nearest-neighbor scaling (fast, for thumbnails).
     /// </summary>
-    public static byte[] DecodeToRgba(string path, out int width, out int height,
+    public static byte[] DecodeToBgra(string path, out int width, out int height,
                                       int maxDimension = 0, bool lowQuality = false)
     {
         using var original = new Bitmap(path);
-        Bitmap bmp;
+        Bitmap bmp = original;
+        bool ownsBmp = false;
 
         if (maxDimension > 0 && (original.Width > maxDimension || original.Height > maxDimension))
         {
@@ -30,6 +39,7 @@ static unsafe class ImageDecoder
             int nh = Math.Max(1, (int)(original.Height * scale));
 
             bmp = new Bitmap(nw, nh, GdiPixelFormat.Format32bppArgb);
+            ownsBmp = true;
             using (var g = Graphics.FromImage(bmp))
             {
                 if (lowQuality)
@@ -46,10 +56,14 @@ static unsafe class ImageDecoder
                 g.DrawImage(original, 0, 0, nw, nh);
             }
         }
-        else
+        else if (!CanLockAs32bpp(original.PixelFormat))
         {
-            bmp = new Bitmap(original); // copy to guarantee 32bpp ARGB access
+            // Exotic source formats (indexed, 16bpp, CMYK, ...) — normalize with one copy.
+            bmp = new Bitmap(original);
+            ownsBmp = true;
         }
+        // else: LockBits converts 24/32bpp sources to 32bppArgb in place, so the
+        // previous unconditional "new Bitmap(original)" full-image copy is avoided.
 
         try
         {
@@ -64,17 +78,20 @@ static unsafe class ImageDecoder
             byte* src = (byte*)bits.Scan0;
             fixed (byte* dst = pixels)
             {
-                for (int y = 0; y < height; y++)
+                if (bits.Stride == rowPitch)
                 {
-                    byte* sRow = src + y * bits.Stride;
-                    byte* dRow = dst + y * rowPitch;
-                    for (int x = 0; x < width; x++)
+                    // Tightly packed — one big copy. Format32bppArgb memory order is
+                    // B,G,R,A, which is exactly the layout the GPU texture expects.
+                    Unsafe.CopyBlock(dst, src, (uint)(rowPitch * height));
+                }
+                else
+                {
+                    for (int y = 0; y < height; y++)
                     {
-                        int o = x * 4;
-                        dRow[o + 0] = sRow[o + 2]; // R ← B  (BGRA → RGBA)
-                        dRow[o + 1] = sRow[o + 1]; // G
-                        dRow[o + 2] = sRow[o + 0]; // B ← R
-                        dRow[o + 3] = sRow[o + 3]; // A
+                        Unsafe.CopyBlock(
+                            dst + (long)y * rowPitch,
+                            src + (long)y * bits.Stride, // handles negative stride too
+                            (uint)rowPitch);
                     }
                 }
             }
@@ -83,7 +100,14 @@ static unsafe class ImageDecoder
         }
         finally
         {
-            if (bmp != original) bmp.Dispose();
+            if (ownsBmp) bmp.Dispose();
         }
     }
+
+    /// <summary>Formats GDI+ can convert to 32bppArgb directly inside LockBits.</summary>
+    static bool CanLockAs32bpp(GdiPixelFormat format) => format
+        is GdiPixelFormat.Format32bppArgb
+        or GdiPixelFormat.Format32bppPArgb
+        or GdiPixelFormat.Format32bppRgb
+        or GdiPixelFormat.Format24bppRgb;
 }

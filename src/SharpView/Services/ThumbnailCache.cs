@@ -14,6 +14,9 @@ sealed class CachedThumbnail
     public int SrvSlot { get; init; }
     public int Width { get; init; }
     public int Height { get; init; }
+
+    /// <summary>Node in the LRU list — stored here so move-to-front is O(1).</summary>
+    public LinkedListNode<string> LruNode { get; set; } = null!;
 }
 
 /// <summary>
@@ -29,7 +32,7 @@ sealed class ThumbnailCache : IDisposable
     readonly DeviceResources _res;
     readonly ConcurrentQueue<ThumbnailData> _pendingQueue = new();
     readonly Dictionary<string, CachedThumbnail> _cache = new();
-    readonly LinkedList<string> _lruOrder = new(); // O(n) Remove is fine for MaxCached=120
+    readonly LinkedList<string> _lruOrder = new(); // O(1) moves via CachedThumbnail.LruNode
     readonly HashSet<string> _loadingSet = new();
     readonly object _lock = new();
     CancellationTokenSource _cts = new();
@@ -41,6 +44,17 @@ sealed class ThumbnailCache : IDisposable
 
     /// <summary>True if decoded thumbnails are waiting to be uploaded to the GPU.</summary>
     public bool HasPendingUploads => !_pendingQueue.IsEmpty;
+
+    /// <summary>True while any thumbnail work (decode or upload) is still outstanding.
+    /// Used by the render loop to keep drawing until the strip is fully populated.</summary>
+    public bool IsBusy
+    {
+        get
+        {
+            if (!_pendingQueue.IsEmpty) return true;
+            lock (_lock) return _loadingSet.Count > 0;
+        }
+    }
 
     /// <summary>Request thumbnails for the given file paths. Skips already cached/loading entries.</summary>
     public void RequestThumbnails(IEnumerable<string> paths)
@@ -60,7 +74,7 @@ sealed class ThumbnailCache : IDisposable
                 try
                 {
                     if (ct.IsCancellationRequested) return;
-                    var pixels = ImageDecoder.DecodeToRgba(path, out int w, out int h,
+                    var pixels = ImageDecoder.DecodeToBgra(path, out int w, out int h,
                         ThumbnailMaxDim, lowQuality: true);
                     if (!ct.IsCancellationRequested)
                         _pendingQueue.Enqueue(new ThumbnailData(path, w, h, pixels));
@@ -75,16 +89,14 @@ sealed class ThumbnailCache : IDisposable
     }
 
     /// <summary>
-    /// Upload pending decoded thumbnails to the GPU. Must be called on the render thread
-    /// with <paramref name="cmdList"/> freshly reset (recording, nothing recorded yet).
-    /// Returns true if any upload commands were recorded — the caller must then execute
-    /// the command list and call <see cref="DeviceResources.WaitForGpu"/>.
+    /// Upload pending decoded thumbnails to the GPU. Must be called on the render
+    /// thread with <paramref name="cmdList"/> in the recording state — typically the
+    /// frame's own command list, right after BeginFrame and before any draws. No GPU
+    /// wait is required: eviction and staging-buffer cleanup use fence-tagged
+    /// <see cref="DeviceResources.DeferRelease"/>, so this never stalls the pipeline.
     /// </summary>
     public bool ProcessUploads(ID3D12GraphicsCommandList cmdList)
     {
-        // Take this frame's batch first so eviction (which may block on the GPU)
-        // happens strictly BEFORE any upload commands are recorded. Evicting mid-batch
-        // would sync the GPU and release staging buffers the open command list still uses.
         var batch = new List<ThumbnailData>(MaxUploadsPerFrame);
         while (batch.Count < MaxUploadsPerFrame && _pendingQueue.TryDequeue(out var data))
             batch.Add(data);
@@ -119,7 +131,7 @@ sealed class ThumbnailCache : IDisposable
             lock (_lock)
             {
                 _cache[data.FilePath] = cached;
-                _lruOrder.AddFirst(data.FilePath);
+                cached.LruNode = _lruOrder.AddFirst(data.FilePath);
             }
 
             uploaded++;
@@ -134,8 +146,9 @@ sealed class ThumbnailCache : IDisposable
         {
             if (_cache.TryGetValue(path, out var cached))
             {
-                _lruOrder.Remove(path);
-                _lruOrder.AddFirst(path);
+                // O(1) move-to-front — no linear search through the LRU list.
+                _lruOrder.Remove(cached.LruNode);
+                _lruOrder.AddFirst(cached.LruNode);
                 return cached;
             }
         }
@@ -144,9 +157,9 @@ sealed class ThumbnailCache : IDisposable
 
     /// <summary>
     /// Evict least-recently-used thumbnails until there is room for
-    /// <paramref name="incomingCount"/> new entries. Performs a full GPU sync before
-    /// disposing, since evicted textures may still be referenced by an in-flight frame.
-    /// Render thread only; must run before recording into this frame's command list.
+    /// <paramref name="incomingCount"/> new entries. Evicted textures may still be
+    /// referenced by an in-flight frame, so they (and their SRV slots) are released
+    /// via fence-tagged deferral instead of a blocking GPU sync. Render thread only.
     /// </summary>
     void EnsureCapacity(int incomingCount)
     {
@@ -166,12 +179,8 @@ sealed class ThumbnailCache : IDisposable
 
         if (evicted is null) return;
 
-        _res.WaitForGpu();
         foreach (var cached in evicted)
-        {
-            cached.Texture.Dispose();
-            _res.FreeSrvSlot(cached.SrvSlot);
-        }
+            _res.DeferRelease(cached.Texture, cached.SrvSlot);
     }
 
     /// <summary>Clear all cached thumbnails and cancel pending loads.</summary>
@@ -187,10 +196,10 @@ sealed class ThumbnailCache : IDisposable
         {
             foreach (var kv in _cache)
             {
-                // Deferred: released at the next full GPU sync (WaitForGpu),
-                // which DeviceResources.Dispose also performs.
-                _res.DeferDisposal(kv.Value.Texture);
-                _res.FreeSrvSlot(kv.Value.SrvSlot);
+                // Fence-tagged deferral: texture AND SRV slot are reclaimed only once
+                // the GPU passes the next fence (WaitForGpu / DeviceResources.Dispose
+                // also release everything remaining).
+                _res.DeferRelease(kv.Value.Texture, kv.Value.SrvSlot);
             }
             _cache.Clear();
             _lruOrder.Clear();

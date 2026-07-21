@@ -24,6 +24,12 @@ sealed class ThumbnailStrip
     float _targetScrollOffset;
     const float ScrollLerpSpeed = 14f;
 
+    // Reused every frame to avoid a per-frame List allocation (GC churn at 60 fps).
+    readonly List<string> _loadRequestBuffer = new();
+
+    /// <summary>True when the scroll animation has reached its target.</summary>
+    public bool IsSettled => _scrollOffset == _targetScrollOffset;
+
     static readonly Vector4 SelectionColor = new(0.0f, 0.47f, 0.83f, 1.0f); // #0078D4
     static readonly Vector4 StripBgColor = new(0.10f, 0.10f, 0.10f, 1.0f);
 
@@ -52,6 +58,8 @@ sealed class ThumbnailStrip
 
         float t = 1f - MathF.Exp(-ScrollLerpSpeed * dt);
         _scrollOffset = Lerp(_scrollOffset, _targetScrollOffset, t);
+        if (MathF.Abs(_scrollOffset - _targetScrollOffset) < 0.4f)
+            _scrollOffset = _targetScrollOffset; // snap → lets the app go idle
 
         // Request loading for visible thumbnails plus a small buffer on each side.
         var (firstVisible, lastVisible) = GetVisibleRange(windowWidth);
@@ -59,10 +67,10 @@ sealed class ThumbnailStrip
         int loadFirst = Math.Max(0, firstVisible - bufferSize);
         int loadLast = Math.Min(nav.Count - 1, lastVisible + bufferSize);
 
-        var pathsToLoad = new List<string>(loadLast - loadFirst + 1);
+        _loadRequestBuffer.Clear();
         for (int i = loadFirst; i <= loadLast; i++)
-            pathsToLoad.Add(nav.Files[i]);
-        _cache.RequestThumbnails(pathsToLoad);
+            _loadRequestBuffer.Add(nav.Files[i]);
+        _cache.RequestThumbnails(_loadRequestBuffer);
     }
 
     /// <summary>Render the thumbnail strip. Viewport should be set to the full window by the caller.</summary>

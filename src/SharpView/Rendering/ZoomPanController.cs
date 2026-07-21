@@ -37,6 +37,9 @@ internal sealed class ZoomPanController
     /// <summary>True when the target zoom is (approximately) 100%.</summary>
     public bool IsOneToOne => MathF.Abs(_targetZoom - 1f) < OneToOneTolerance;
 
+    /// <summary>True when the animation has fully reached its targets (nothing left to animate).</summary>
+    public bool IsSettled => _zoom == _targetZoom && _panX == _targetPanX && _panY == _targetPanY;
+
     /// <summary>Advance the smooth animation toward the targets. Call once per frame.</summary>
     public void Update(float dt)
     {
@@ -44,6 +47,13 @@ internal sealed class ZoomPanController
         _zoom = Lerp(_zoom, _targetZoom, t);
         _panX = Lerp(_panX, _targetPanX, t);
         _panY = Lerp(_panY, _targetPanY, t);
+
+        // Snap once the remaining distance is visually indistinguishable, so
+        // IsSettled becomes true and the render loop can stop redrawing.
+        if (MathF.Abs(_zoom - _targetZoom) < MathF.Max(_targetZoom, 0.01f) * 0.0005f)
+            _zoom = _targetZoom;
+        if (MathF.Abs(_panX - _targetPanX) < 0.05f) _panX = _targetPanX;
+        if (MathF.Abs(_panY - _targetPanY) < 0.05f) _panY = _targetPanY;
     }
 
     /// <summary>
