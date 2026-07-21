@@ -35,7 +35,7 @@ sealed unsafe class DeviceResources : IDisposable
     /// <summary>Opacity of the black veil drawn wherever no opaque content (image,
     /// thumbnails) covers the window: 0 = that area is fully invisible, 1 = classic
     /// solid black. The image itself always renders fully opaque on top of it.</summary>
-    public const float BackdropAlpha = 0.5f;
+    public const float BackdropAlpha = 0.65f;
     public const int MaxSrvSlots = 256;
     const int MaxCbSlots = 64;
     const int CbSlotSize = 256; // constant buffer views must be 256-byte aligned

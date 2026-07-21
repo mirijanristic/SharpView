@@ -31,18 +31,13 @@ sealed class ThumbnailStrip
     public bool IsSettled => _scrollOffset == _targetScrollOffset;
 
     static readonly Vector4 SelectionColor = new(0.0f, 0.47f, 0.83f, 1.0f); // #0078D4
-    // Translucent: the strip reads as a glassy bar with the desktop shimmering
-    // through (the shader premultiplies alpha). Set a back to 1 for a solid bar.
-    static readonly Vector4 StripBgColor = new(0.06f, 0.06f, 0.06f, 0.55f);
 
     // Constant buffer slot layout (slot 0 belongs to ImageRenderer):
-    //   1        strip background
-    //   2..33    thumbnails (up to MaxVisibleThumbs)
-    //   34..37   selection border quads
-    const int CbSlotStripBg = 1;
-    const int CbSlotThumbStart = 2;
+    //   1..32    thumbnails (up to MaxVisibleThumbs)
+    //   33..36   selection border quads
+    const int CbSlotThumbStart = 1;
     const int MaxVisibleThumbs = 32;
-    const int CbSlotBorderStart = CbSlotThumbStart + MaxVisibleThumbs; // 34
+    const int CbSlotBorderStart = CbSlotThumbStart + MaxVisibleThumbs; // 33
 
     public ThumbnailStrip(DeviceResources res, ThumbnailCache cache)
     {
@@ -82,12 +77,13 @@ sealed class ThumbnailStrip
 
         float stripY = windowHeight - StripHeight;
 
-        // 1. Strip background
-        WriteRectConstants(CbSlotStripBg, 0, stripY, windowWidth, StripHeight,
-            windowWidth, windowHeight, StripBgColor);
-        _res.DrawQuad(_res.WhiteSrvSlot, CbSlotStripBg);
+        // No background quad on purpose: the strip area keeps the same translucent
+        // backdrop as the rest of the window and the thumbnails float on it.
+        // (If a background ever returns, don't fade it out with tint a = 0 —
+        // TintColor.a is the shader's solid-color mode flag, so a = 0 falls
+        // through to texture mode and paints the white texture as an opaque bar.)
 
-        // 2. Visible thumbnails
+        // 1. Visible thumbnails
         var (firstVisible, lastVisible) = GetVisibleRange(windowWidth);
         firstVisible = Math.Max(0, firstVisible);
         lastVisible = Math.Min(nav.Count - 1, lastVisible);
@@ -121,7 +117,7 @@ sealed class ThumbnailStrip
             thumbsDrawn++;
         }
 
-        // 3. Selection border around the current thumbnail
+        // 2. Selection border around the current thumbnail
         DrawSelectionBorder(windowWidth, windowHeight, nav.CurrentIndex, stripY);
     }
 
