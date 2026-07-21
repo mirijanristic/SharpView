@@ -1,0 +1,20 @@
+# Build output
+bin/
+obj/
+publish/
+artifacts/
+
+# IDE
+.vs/
+.idea/
+*.user
+*.suo
+*.DotSettings.user
+
+# Test results
+TestResults/
+*.trx
+
+# OS
+Thumbs.db
+Desktop.ini

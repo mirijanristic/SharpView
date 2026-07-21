@@ -1,0 +1,12 @@
+<Project>
+
+  <!-- Shared settings for every project in this repository. -->
+  <PropertyGroup>
+    <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AnalysisLevel>latest</AnalysisLevel>
+    <Deterministic>true</Deterministic>
+  </PropertyGroup>
+
+</Project>
