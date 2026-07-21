@@ -16,6 +16,7 @@
 
     <Product>SharpView</Product>
     <Description>GPU-accelerated image viewer built on Direct3D 12</Description>
+    <ApplicationIcon>icon.ico</ApplicationIcon>
   </PropertyGroup>
 
   <ItemGroup>
