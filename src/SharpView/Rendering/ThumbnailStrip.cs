@@ -170,10 +170,6 @@ sealed class ThumbnailStrip
         _res.WriteConstants(cbSlot, new ViewConstants
         {
             Transform = Matrix4x4.Transpose(xform),
-            TexWidth = w,
-            TexHeight = h,
-            ViewWidth = viewW,
-            ViewHeight = viewH,
             TintColor = tintColor,
         });
     }

@@ -81,8 +81,6 @@ sealed unsafe class DeviceResources : IDisposable
 
     bool _disposed;
 
-    public int FrameIndex => _frameIndex;
-    public int SrvDescSize => _srvDescSize;
     public int WhiteSrvSlot => _whiteSrvSlot;
 
     public void Init(IntPtr hwnd, int width, int height)
@@ -181,8 +179,11 @@ sealed unsafe class DeviceResources : IDisposable
         var sampler = new StaticSamplerDescription(
             ShaderVisibility.Pixel, 0, 0)
         {
-            Filter = Filter.Anisotropic,
-            MaxAnisotropy = 16,
+            // Linear, not anisotropic: without a mip chain, aniso spends up to 16 taps
+            // on the most cache-hostile draw (fit view of a huge photo) for virtually
+            // no quality gain. Switch back to Anisotropic once mipmaps are generated.
+            Filter = Filter.MinMagMipLinear,
+            MaxAnisotropy = 1,
             AddressU = TextureAddressMode.Clamp,
             AddressV = TextureAddressMode.Clamp,
             AddressW = TextureAddressMode.Clamp,
@@ -220,7 +221,10 @@ sealed unsafe class DeviceResources : IDisposable
             InputLayout = new InputLayoutDescription(inputLayout),
             PrimitiveTopologyType = PrimitiveTopologyType.Triangle,
             RasterizerState = RasterizerDescription.CullNone,
-            BlendState = BlendDescription.AlphaBlend,
+            // Opaque, not AlphaBlend: the shader always outputs alpha = 1 (images are
+            // composited onto the checkerboard inside the shader; solid tints use
+            // a = 1), so blending only cost ROP bandwidth without changing any pixel.
+            BlendState = BlendDescription.Opaque,
             DepthStencilState = DepthStencilDescription.None,
             SampleMask = uint.MaxValue,
             RenderTargetFormats = new[] { BackBufferFormat },

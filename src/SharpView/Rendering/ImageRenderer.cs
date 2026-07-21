@@ -42,8 +42,12 @@ sealed class ImageRenderer : IDisposable
     readonly HashSet<string> _prefetchInFlight = new(StringComparer.OrdinalIgnoreCase);
     long _prefetchBytes;
 
-    public int TextureWidth => _texW;
-    public int TextureHeight => _texH;
+    // Promotion: when a navigation request targets a file that is currently being
+    // prefetched, the finished prefetch is delivered directly to the pending queue
+    // instead of decoding the same image a second time. Guarded by _prefetchLock.
+    string? _promotePath;
+    int _promoteGeneration;
+
     public bool HasImage => _texW > 0;
     public bool IsOneToOne => _view.IsOneToOne;
 
@@ -70,8 +74,33 @@ sealed class ImageRenderer : IDisposable
     {
         int generation = Interlocked.Increment(ref _loadGeneration);
 
-        // Prefetched? No decode needed.
-        DecodedImage? cached = TakePrefetched(path);
+        DecodedImage? cached = null;
+        lock (_prefetchLock)
+        {
+            if (_prefetched.Remove(path, out cached))
+            {
+                // Prefetched and ready — no decode needed at all.
+                _prefetchOrder.Remove(path); // O(n), n ≤ PrefetchMaxEntries
+                _prefetchBytes -= cached.Pixels.LongLength;
+                _promotePath = null;
+            }
+            else if (_prefetchInFlight.Contains(path))
+            {
+                // This exact file is being decoded by a prefetch worker right now.
+                // Starting a second decode would double the work during fast browsing,
+                // so register a promotion instead: when the prefetch finishes,
+                // StorePrefetched delivers it straight into the pending queue under
+                // this generation.
+                _promotePath = path;
+                _promoteGeneration = generation;
+                return;
+            }
+            else
+            {
+                _promotePath = null; // navigating elsewhere cancels a stale promotion
+            }
+        }
+
         if (cached is not null)
         {
             _pendingImages.Enqueue(cached with { Generation = generation });
@@ -133,7 +162,12 @@ sealed class ImageRenderer : IDisposable
             }
             catch
             {
-                // Corrupt/unsupported file — a real load attempt will surface the error.
+                // Corrupt/unsupported file — a real load attempt would fail the same
+                // way, so also drop any pending promotion registered for it.
+                lock (_prefetchLock)
+                {
+                    if (_promotePath == path) _promotePath = null;
+                }
             }
             finally
             {
@@ -145,10 +179,21 @@ sealed class ImageRenderer : IDisposable
     void StorePrefetched(string path, DecodedImage img)
     {
         long size = img.Pixels.LongLength;
-        if (size > PrefetchMaxBytes) return; // larger than the entire budget — skip
 
         lock (_prefetchLock)
         {
+            // A navigation request for this exact file arrived while it was still
+            // decoding — deliver it straight to the pending queue under the recorded
+            // generation instead of caching it (the "promotion" path). This is what
+            // prevents decoding the same image twice during fast arrow-key browsing.
+            if (_promotePath == path)
+            {
+                _pendingImages.Enqueue(img with { Generation = _promoteGeneration });
+                _promotePath = null;
+                return;
+            }
+
+            if (size > PrefetchMaxBytes) return; // larger than the entire budget — skip
             if (_prefetched.ContainsKey(path)) return;
 
             _prefetched[path] = img;
@@ -164,17 +209,6 @@ sealed class ImageRenderer : IDisposable
                 if (_prefetched.Remove(oldest, out var evicted))
                     _prefetchBytes -= evicted.Pixels.LongLength;
             }
-        }
-    }
-
-    DecodedImage? TakePrefetched(string path)
-    {
-        lock (_prefetchLock)
-        {
-            if (!_prefetched.Remove(path, out var img)) return null;
-            _prefetchOrder.Remove(path); // O(n) with n ≤ PrefetchMaxEntries
-            _prefetchBytes -= img.Pixels.LongLength;
-            return img;
         }
     }
 
@@ -248,10 +282,6 @@ sealed class ImageRenderer : IDisposable
         var cb = new ViewConstants
         {
             Transform = Matrix4x4.Transpose(xform),
-            TexWidth = _texW,
-            TexHeight = _texH,
-            ViewWidth = viewW,
-            ViewHeight = viewH,
             TintColor = Vector4.Zero,
         };
         _res.WriteConstants(CbSlot, cb);

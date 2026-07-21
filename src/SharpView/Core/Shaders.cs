@@ -10,10 +10,6 @@ static class Shaders
         cbuffer ViewCB : register(b0)
         {
             float4x4 Transform;
-            float TexWidth;
-            float TexHeight;
-            float ViewWidth;
-            float ViewHeight;
             float4 TintColor;
         };
 

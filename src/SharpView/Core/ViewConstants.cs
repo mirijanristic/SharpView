@@ -10,10 +10,6 @@ namespace SharpView.Core;
 [StructLayout(LayoutKind.Sequential, Pack = 4)]
 struct ViewConstants
 {
-    public Matrix4x4 Transform;
-    public float TexWidth;
-    public float TexHeight;
-    public float ViewWidth;
-    public float ViewHeight;
-    public Vector4 TintColor; // alpha > 0 = solid color mode (ignore texture)
+    public Matrix4x4 Transform;               // offset 0,  64 bytes
+    public Vector4 TintColor;                 // offset 64; alpha > 0 = solid color mode (ignore texture)
 }
