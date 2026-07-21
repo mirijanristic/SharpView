@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using SharpView.Platform;
 using SharpView.Rendering;
 using SharpView.Services;
 
@@ -48,8 +49,9 @@ sealed class ViewerApp : IDisposable
         _form = new ViewerForm
         {
             Text = $"SharpView — {Path.GetFileName(imagePath)}",
-            ClientSize = new Size(_width, _height),
+            ClientSize = new Size(_width, _height), // restored (un-maximized) size
             StartPosition = FormStartPosition.CenterScreen,
+            WindowState = FormWindowState.Maximized, // start full screen
             BackColor = Color.FromArgb(18, 18, 18),
             KeyPreview = true,
         };
@@ -94,19 +96,19 @@ sealed class ViewerApp : IDisposable
     void InitGraphics()
     {
         _res.Init(_form.Handle, _width, _height);
+        WindowStyling.ApplyDarkStyle(_form.Handle); // dark title bar + Mica caption
 
         _imageRenderer = new ImageRenderer(_res);
         _thumbCache = new ThumbnailCache(_res);
         _thumbStrip = new ThumbnailStrip(_res, _thumbCache);
 
         // Decode the initial image synchronously; the GPU upload itself is recorded
-        // into the first frame's command list. No animation on first show:
-        // true 1:1 when the image fits the window, fit-to-window when it is bigger.
+        // into the first frame's command list. The startup zoom (true 1:1 when the
+        // image fits, fit-to-window when it is bigger) is applied in Run(), once
+        // the maximized client size is actually known.
         _imageRenderer.LoadImageSync(_initialImagePath);
-        _imageRenderer.FitOrOneToOneInstant(_width, MainViewHeight);
 
         _nav.ScanFolder(_initialImagePath);
-        _thumbStrip.SnapToIndex(_nav.CurrentIndex, _width);
         PrefetchNeighbors(); // next/prev are pre-decoded before the user asks
         UpdateTitle();
     }
@@ -116,6 +118,15 @@ sealed class ViewerApp : IDisposable
     public void Run()
     {
         _form.Show();
+
+        // The window opens maximized, so the real client size is only known now:
+        // sync the swap chain to it and apply the startup view (1:1 when the image
+        // fits, fit-to-window when it is bigger) before the first frame.
+        _needsResize = false;
+        HandleResize();
+        _imageRenderer.FitOrOneToOneInstant(_width, MainViewHeight);
+        _thumbStrip.SnapToIndex(_nav.CurrentIndex, _width);
+
         _lastFrameTime = _clock.Elapsed.TotalSeconds;
 
         while (_running && _form.Visible)
