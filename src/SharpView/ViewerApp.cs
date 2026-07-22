@@ -25,6 +25,7 @@ sealed class ViewerApp : IDisposable
     ImageRenderer _imageRenderer = null!;
     ThumbnailStrip _thumbStrip = null!;
     ThumbnailCache _thumbCache = null!;
+    TopBar _topBar = null!;
 
     bool _running = true, _needsResize;
     bool _dragging;
@@ -102,6 +103,21 @@ sealed class ViewerApp : IDisposable
 
         _thumbCache = new ThumbnailCache(_res);
         _thumbStrip = new ThumbnailStrip(_res, _thumbCache);
+        _topBar = new TopBar(_res);
+
+        // The bar's zone doubles as the window caption: Windows itself runs the
+        // move loop for it (drag-restore from maximized, Aero Snap, dragging to
+        // the other monitor, double-click restore, right-click system menu). Only
+        // the X stays client area so our own mouse handler gets the click.
+        _form.HitTestHandler = (x, y) => _topBar.HitTest(x, y, _width) switch
+        {
+            TopBar.Hit.Close => ViewerForm.HTClient,
+            TopBar.Hit.Drag => ViewerForm.HTCaption,
+            _ => 0,
+        };
+        // Caption-zone mouse moves arrive as non-client messages, not MouseMove —
+        // wake the loop so the bar's hover logic (in Update) gets frames to run.
+        _form.NonClientMouseMove = Wake;
 
         _nav.ScanFolder(_initialImagePath);
         PrefetchNeighbors(); // next/prev are pre-decoded before the user asks
@@ -159,6 +175,7 @@ sealed class ViewerApp : IDisposable
         || _needsResize
         || !_imageRenderer.IsAnimationSettled
         || !_thumbStrip.IsSettled
+        || _topBar.WantsFrames // visible/fading bar polls the cursor each frame
         || _imageRenderer.IsBusy
         || _thumbCache.IsBusy
         || (!_firstImageShown && !_initialFailureReported); // initial load still resolving
@@ -201,6 +218,15 @@ sealed class ViewerApp : IDisposable
 
         _imageRenderer.Update(dt, _width, MainViewHeight);
         _thumbStrip.Update(dt, _width, _height, _nav);
+
+        // Hover top bar: polled rather than event-driven, because its caption zone
+        // produces no client MouseMove and the mouse can leave the window sideways
+        // (toward the other monitor) without any message at all. Hidden while
+        // dragging so the bar stays out of the way of a pan near the top edge.
+        var cursor = _form.PointToClient(Cursor.Position);
+        bool cursorAvailable = !_dragging && _form.ContainsFocus
+                               && _form.ClientRectangle.Contains(cursor);
+        _topBar.Update(dt, _width, cursor.X, cursor.Y, cursorAvailable);
     }
 
     void RenderFrame()
@@ -223,6 +249,9 @@ sealed class ViewerApp : IDisposable
         // Thumbnail strip (full-window viewport for pixel-coordinate rendering)
         _res.SetViewportAndScissor(0, 0, _width, _height);
         _thumbStrip.Render(_width, _height, _nav);
+
+        // Hover top bar — drawn last, overlays the image (full-window viewport).
+        _topBar.Render(_width, _height);
 
         _res.EndFrame();
     }
@@ -274,6 +303,15 @@ sealed class ViewerApp : IDisposable
     {
         if (e.Button != MouseButtons.Left) return;
 
+        // The top bar's X? (Checked first — the bar overlays everything. The rest
+        // of the bar never gets here: it hit-tests as caption, so Windows turns
+        // clicks there into a window drag.)
+        if (_topBar.HitTestClose(e.X, e.Y, _width))
+        {
+            _running = false;
+            return;
+        }
+
         // Click on the thumbnail strip?
         int thumbIndex = _thumbStrip.HitTest(e.X, e.Y, _width, _height, _nav.Count);
         if (thumbIndex >= 0)
@@ -305,7 +343,14 @@ sealed class ViewerApp : IDisposable
 
     void OnMouseMove(object? s, MouseEventArgs e)
     {
-        if (!_dragging) return;
+        if (!_dragging)
+        {
+            // Near the top edge? Give the bar's hover logic a frame to run (its
+            // trigger zone is mostly caption, but the X area is client — and this
+            // also catches re-entry from just below the bar).
+            if (e.Y < TopBar.BarHeight) Wake();
+            return;
+        }
         float dx = e.X - _lastMouse.X, dy = e.Y - _lastMouse.Y;
         _imageRenderer.Pan(dx, dy);
         _lastMouse = e.Location;

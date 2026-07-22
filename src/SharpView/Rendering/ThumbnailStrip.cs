@@ -35,6 +35,7 @@ sealed class ThumbnailStrip
     // Constant buffer slot layout (slot 0 belongs to ImageRenderer):
     //   1..32    thumbnails (up to MaxVisibleThumbs)
     //   33..36   selection border quads
+    //   37..40   hover top bar (see TopBar)
     const int CbSlotThumbStart = 1;
     const int MaxVisibleThumbs = 32;
     const int CbSlotBorderStart = CbSlotThumbStart + MaxVisibleThumbs; // 33
