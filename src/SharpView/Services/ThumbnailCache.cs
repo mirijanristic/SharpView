@@ -25,7 +25,11 @@ sealed class CachedThumbnail
 /// </summary>
 sealed class ThumbnailCache : IDisposable
 {
-    const int ThumbnailMaxDim = 80;
+    /// <summary>Side of the square thumbnails this cache produces, in pixels. The
+    /// decoder delivers exactly this size (cover-scaled + center-cropped with
+    /// high-quality filtering) and the strip draws it 1:1, so the GPU never
+    /// resamples a thumbnail — that is what keeps them sharp.</summary>
+    public const int ThumbnailSize = 55;
     const int MaxCached = 120;
     const int MaxUploadsPerFrame = 4;
 
@@ -74,10 +78,9 @@ sealed class ThumbnailCache : IDisposable
                 try
                 {
                     if (ct.IsCancellationRequested) return;
-                    var pixels = ImageDecoder.DecodeToBgra(path, out int w, out int h,
-                        ThumbnailMaxDim, lowQuality: true);
+                    var pixels = ImageDecoder.DecodeSquareBgra(path, ThumbnailSize);
                     if (!ct.IsCancellationRequested)
-                        _pendingQueue.Enqueue(new ThumbnailData(path, w, h, pixels));
+                        _pendingQueue.Enqueue(new ThumbnailData(path, ThumbnailSize, ThumbnailSize, pixels));
                 }
                 catch
                 {

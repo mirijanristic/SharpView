@@ -1,3 +1,4 @@
+using Vortice.Mathematics;
 using Vortice.WIC;
 
 using WicPixelFormat = Vortice.WIC.PixelFormat;
@@ -121,5 +122,47 @@ static class WicDecoder
         {
             scaler?.Dispose();
         }
+    }
+
+    /// <summary>
+    /// Decode an image straight into an exactly <paramref name="size"/>×<paramref name="size"/>,
+    /// center-cropped ("cover") 32bpp BGRA square. The scaler again sits directly on
+    /// the frame, so JPEG prescales natively, and always uses Fant filtering —
+    /// proper prefiltered downscaling is what makes small thumbnails look clean
+    /// instead of aliased (Linear only ever samples 2×2 source pixels, so at large
+    /// ratios it effectively point-samples). Sources smaller than the square are
+    /// scaled up to fill it, keeping the thumbnail grid uniform.
+    /// </summary>
+    public static byte[] DecodeSquareBgra(string path, int size)
+    {
+        using var factory = new IWICImagingFactory();
+        using var decoder = factory.CreateDecoderFromFileName(
+            path, FileAccess.Read, DecodeOptions.CacheOnDemand);
+        using var frame = decoder.GetFrame(0);
+
+        var srcSize = frame.Size;
+        int srcW = srcSize.Width, srcH = srcSize.Height;
+
+        // Cover: scale so the SHORT side lands exactly on `size` (the long side
+        // overshoots), then clip the centered square out of the overshoot.
+        float scale = Math.Max((float)size / srcW, (float)size / srcH);
+        int scaledW = Math.Max(size, (int)MathF.Round(srcW * scale));
+        int scaledH = Math.Max(size, (int)MathF.Round(srcH * scale));
+
+        using var scaler = factory.CreateBitmapScaler();
+        scaler.Initialize(frame, (uint)scaledW, (uint)scaledH, BitmapInterpolationMode.Fant);
+
+        using var clipper = factory.CreateBitmapClipper();
+        clipper.Initialize(scaler, new RectI(
+            (scaledW - size) / 2, (scaledH - size) / 2, size, size));
+
+        using var converter = factory.CreateFormatConverter();
+        converter.Initialize(clipper, WicPixelFormat.Format32bppBGRA,
+            BitmapDitherType.None, null, 0.0, BitmapPaletteType.Custom);
+
+        int stride = size * 4;
+        byte[] pixels = new byte[stride * size];
+        converter.CopyPixels((uint)stride, pixels);
+        return pixels;
     }
 }

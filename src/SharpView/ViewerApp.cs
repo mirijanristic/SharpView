@@ -109,12 +109,13 @@ sealed class ViewerApp : IDisposable
         // move loop for it (drag-restore from maximized, Aero Snap, dragging to
         // the other monitor, double-click restore, right-click system menu). Only
         // the X stays client area so our own mouse handler gets the click.
-        _form.HitTestHandler = (x, y) => _topBar.HitTest(x, y, _width) switch
-        {
-            TopBar.Hit.Close => ViewerForm.HTClient,
-            TopBar.Hit.Drag => ViewerForm.HTCaption,
-            _ => 0,
-        };
+        _form.HitTestHandler = (x, y) =>
+            _topBar.HitTest(x, y, _width, _form.WindowState == FormWindowState.Maximized) switch
+            {
+                TopBar.Hit.Close => ViewerForm.HTClient,
+                TopBar.Hit.Drag => ViewerForm.HTCaption,
+                _ => 0,
+            };
         // Caption-zone mouse moves arrive as non-client messages, not MouseMove —
         // wake the loop so the bar's hover logic (in Update) gets frames to run.
         _form.NonClientMouseMove = Wake;
@@ -124,7 +125,13 @@ sealed class ViewerApp : IDisposable
         UpdateTitle();
     }
 
-    int MainViewHeight => _height - ThumbnailStrip.StripHeight;
+    /// <summary>Height of the main image area: from the very top of the window
+    /// (the hover top bar OVERLAYS the image rather than reserving space for
+    /// itself) down to the thumbnail strip's reserved bottom band.</summary>
+    int MainViewHeight => _height - ThumbnailStrip.ReservedHeight;
+
+    /// <summary>True when a window-space Y lies inside the main image area.</summary>
+    bool InMainView(int y) => y >= 0 && y < MainViewHeight;
 
     public void Run()
     {
@@ -226,7 +233,8 @@ sealed class ViewerApp : IDisposable
         var cursor = _form.PointToClient(Cursor.Position);
         bool cursorAvailable = !_dragging && _form.ContainsFocus
                                && _form.ClientRectangle.Contains(cursor);
-        _topBar.Update(dt, _width, cursor.X, cursor.Y, cursorAvailable);
+        _topBar.Update(dt, _width, cursor.X, cursor.Y, cursorAvailable,
+            _form.WindowState == FormWindowState.Maximized);
     }
 
     void RenderFrame()
@@ -242,7 +250,8 @@ sealed class ViewerApp : IDisposable
         if (_thumbCache.HasPendingUploads)
             _thumbCache.ProcessUploads(_res.CommandList);
 
-        // Main image (top area)
+        // Main image (from the top of the window down to the strip band; the
+        // hover top bar is drawn later as an overlay on top of it)
         _res.SetViewportAndScissor(0, 0, _width, MainViewHeight);
         _imageRenderer.Render();
 
@@ -291,8 +300,9 @@ sealed class ViewerApp : IDisposable
 
     void OnMouseWheel(object? s, MouseEventArgs e)
     {
-        // Only zoom while the cursor is over the main image area.
-        if (e.Y < MainViewHeight)
+        // Only zoom while the cursor is over the main image area (which now spans
+        // from the very top, so window Y and viewport Y are the same thing).
+        if (InMainView(e.Y))
         {
             _imageRenderer.ZoomAt(e.Delta, e.X, e.Y, _width, MainViewHeight);
             Wake();
@@ -322,7 +332,7 @@ sealed class ViewerApp : IDisposable
         }
 
         // Otherwise start dragging the main image.
-        if (e.Y < MainViewHeight)
+        if (InMainView(e.Y))
         {
             _dragging = true;
             _lastMouse = e.Location;
@@ -358,7 +368,7 @@ sealed class ViewerApp : IDisposable
 
     void OnMouseDoubleClick(object? s, MouseEventArgs e)
     {
-        if (e.Button != MouseButtons.Left || e.Y >= MainViewHeight) return;
+        if (e.Button != MouseButtons.Left || !InMainView(e.Y)) return;
 
         if (!_imageRenderer.IsOneToOne)
             _imageRenderer.SetOneToOne();

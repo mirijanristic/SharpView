@@ -32,7 +32,7 @@ static unsafe class ImageDecoder
     /// <summary>
     /// Decodes an image file into tightly packed BGRA pixel bytes. Returns dimensions
     /// via out params. Optionally resizes to fit within <paramref name="maxDimension"/>.
-    /// <paramref name="lowQuality"/> uses cheaper scaling (for thumbnails).
+    /// <paramref name="lowQuality"/> uses cheaper scaling (fast previews).
     /// </summary>
     public static byte[] DecodeToBgra(string path, out int width, out int height,
                                       int maxDimension = 0, bool lowQuality = false)
@@ -50,6 +50,71 @@ static unsafe class ImageDecoder
         }
 
         return GdiDecodeToBgra(path, out width, out height, maxDimension, lowQuality);
+    }
+
+    /// <summary>
+    /// Decode an image straight into an exactly <paramref name="size"/>×<paramref name="size"/>
+    /// center-cropped ("cover") BGRA square — the thumbnail path. WIC decodes with
+    /// Fant prefiltering (clean downscales); the GDI+ fallback uses bicubic.
+    /// Cropped, not stretched, so nothing is distorted; smaller sources are scaled
+    /// up to fill the square so the thumbnail grid stays uniform.
+    /// </summary>
+    public static byte[] DecodeSquareBgra(string path, int size)
+    {
+        if (WicDecoder.IsAvailable)
+        {
+            try
+            {
+                return WicDecoder.DecodeSquareBgra(path, size);
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"[ImageDecoder] WIC square decode failed for '{path}', falling back to GDI+: {ex.Message}");
+            }
+        }
+
+        return GdiDecodeSquareBgra(path, size);
+    }
+
+    static byte[] GdiDecodeSquareBgra(string path, int size)
+    {
+        using var original = new Bitmap(path);
+
+        // Centered source square (side = the shorter dimension), drawn to fill the
+        // whole size×size destination — same cover-crop the WIC path produces.
+        int side = Math.Min(original.Width, original.Height);
+        int srcX = (original.Width - side) / 2;
+        int srcY = (original.Height - side) / 2;
+
+        using var bmp = new Bitmap(size, size, GdiPixelFormat.Format32bppArgb);
+        using (var g = Graphics.FromImage(bmp))
+        {
+            g.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.HighQualityBicubic;
+            g.PixelOffsetMode = System.Drawing.Drawing2D.PixelOffsetMode.HighQuality;
+            g.CompositingQuality = System.Drawing.Drawing2D.CompositingQuality.HighQuality;
+            g.DrawImage(original,
+                new GdiRectangle(0, 0, size, size),
+                srcX, srcY, side, side, GraphicsUnit.Pixel);
+        }
+
+        int rowPitch = size * 4;
+        byte[] pixels = new byte[rowPitch * size];
+
+        var bits = bmp.LockBits(new GdiRectangle(0, 0, size, size),
+            ImageLockMode.ReadOnly, GdiPixelFormat.Format32bppArgb);
+        byte* src = (byte*)bits.Scan0;
+        fixed (byte* dst = pixels)
+        {
+            for (int y = 0; y < size; y++)
+            {
+                Unsafe.CopyBlock(
+                    dst + (long)y * rowPitch,
+                    src + (long)y * bits.Stride,
+                    (uint)rowPitch);
+            }
+        }
+        bmp.UnlockBits(bits);
+        return pixels;
     }
 
     // ─── GDI+ fallback (original path) ────────────────────────────────
@@ -81,7 +146,11 @@ static unsafe class ImageDecoder
                 }
                 else
                 {
-                    g.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.Bilinear;
+                    // Bicubic + high-quality pixel offset: properly prefiltered
+                    // downscaling. Plain bilinear only samples 2×2 source pixels,
+                    // so at large ratios it skips most of them and aliases badly.
+                    g.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.HighQualityBicubic;
+                    g.PixelOffsetMode = System.Drawing.Drawing2D.PixelOffsetMode.HighQuality;
                 }
                 g.DrawImage(original, 0, 0, nw, nh);
             }

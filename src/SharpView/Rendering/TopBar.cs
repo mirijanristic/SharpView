@@ -16,8 +16,10 @@ sealed class TopBar
 {
     /// <summary>Height of the visible strip (also the hover keep-alive zone).</summary>
     public const int BarHeight = 34;
-    /// <summary>Height of the invisible reveal zone while the bar is hidden — kept
-    /// thin so working near the top edge does not pop the bar up constantly.</summary>
+    /// <summary>Height of the invisible reveal zone while the bar is hidden and the
+    /// window is maximized — kept thin so working near the top edge does not pop the
+    /// bar up constantly. In a restored (windowed) state the reveal zone is the full
+    /// <see cref="BarHeight"/> instead: exactly where a title bar would be.</summary>
     public const int TriggerHeight = 8;
     const int CloseWidth = 46;           // close button hit rect (right-aligned)
     const float FadeSpeed = 12f;         // exponential fade rate, 1/s
@@ -61,14 +63,17 @@ sealed class TopBar
     /// are client pixels; <paramref name="cursorAvailable"/> should be false when the
     /// cursor is outside the client area, the app is not focused, or an image drag is
     /// in progress (the bar stays out of the way while panning).
+    /// <paramref name="windowMaximized"/> is passed fresh on every call because it can
+    /// flip mid-drag (drag-restore) while the render loop is blocked.
     /// </summary>
-    public void Update(float dt, int windowWidth, int cursorX, int cursorY, bool cursorAvailable)
+    public void Update(float dt, int windowWidth, int cursorX, int cursorY,
+                       bool cursorAvailable, bool windowMaximized)
     {
         if (_startupHold > 0f) _startupHold -= dt;
 
-        // Hysteresis: the thin zone reveals the bar, the full bar height keeps it
-        // alive — no flicker right at the trigger boundary.
-        int zone = _opacity > 0.01f ? BarHeight : TriggerHeight;
+        // Hysteresis: the hidden-state zone reveals the bar, the full bar height
+        // keeps it alive — no flicker right at the trigger boundary.
+        int zone = _opacity > 0.01f ? BarHeight : HiddenZone(windowMaximized);
         bool inZone = cursorAvailable && cursorY >= 0 && cursorY < zone;
 
         _targetOpacity = inZone || _startupHold > 0f ? 1f : 0f;
@@ -88,12 +93,19 @@ sealed class TopBar
         && x >= windowWidth - CloseWidth && x < windowWidth;
 
     /// <summary>Semantic hit test for WM_NCHITTEST (window drag vs. close click).</summary>
-    public Hit HitTest(int x, int y, int windowWidth)
+    public Hit HitTest(int x, int y, int windowWidth, bool windowMaximized)
     {
-        int zone = _opacity > 0.01f ? BarHeight : TriggerHeight;
+        int zone = _opacity > 0.01f ? BarHeight : HiddenZone(windowMaximized);
         if (y < 0 || y >= zone || x < 0 || x >= windowWidth) return Hit.None;
         return HitTestClose(x, y, windowWidth) ? Hit.Close : Hit.Drag;
     }
+
+    /// <summary>Reveal/drag zone while the bar is hidden: thin when maximized (the
+    /// top screen edge is a huge target, accidental pops are the concern), the full
+    /// bar height when windowed — there it sits exactly where a title bar would be,
+    /// so revealing and grabbing the window stays easy.</summary>
+    static int HiddenZone(bool windowMaximized)
+        => windowMaximized ? TriggerHeight : BarHeight;
 
     /// <summary>Draw the bar. The viewport must cover the full window.</summary>
     public void Render(int windowWidth, int windowHeight)

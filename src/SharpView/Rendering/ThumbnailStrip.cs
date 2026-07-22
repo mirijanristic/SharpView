@@ -14,8 +14,16 @@ sealed class ThumbnailStrip
     readonly ThumbnailCache _cache;
 
     // Layout constants
-    public const int StripHeight = 75;
-    const int ThumbSize = 55;       // thumbnail image max dimension
+    /// <summary>Height of the strip band itself.</summary>
+    public const int StripHeight = 85;
+    /// <summary>Gap between the strip and the bottom window edge. In fullscreen the
+    /// taskbar shows through the translucent backdrop exactly there, so the strip
+    /// is lifted above it to stay readable.</summary>
+    public const int BottomMargin = 5;
+    /// <summary>Total vertical space reserved at the bottom (strip + margin) —
+    /// the main image viewport must stay above this.</summary>
+    public const int ReservedHeight = StripHeight + BottomMargin;
+    const int ThumbSize = ThumbnailCache.ThumbnailSize; // squares drawn 1:1 at decode size
     const int CellWidth = 65;       // cell width including padding
     const int BorderWidth = 2;
 
@@ -51,8 +59,12 @@ sealed class ThumbnailStrip
     {
         if (!nav.HasFiles) return;
 
-        // Center the current thumbnail.
-        _targetScrollOffset = windowWidth * 0.5f - nav.CurrentIndex * CellWidth - CellWidth * 0.5f;
+        // Center the current thumbnail. Rounded to a whole pixel: with an integer
+        // offset every derived cell/border coordinate is integral too, so settled
+        // thumbnails map texel-per-pixel (decode size == draw size) and stay
+        // perfectly sharp instead of landing on blur-inducing half-pixels.
+        _targetScrollOffset = MathF.Round(
+            windowWidth * 0.5f - nav.CurrentIndex * CellWidth - CellWidth * 0.5f);
 
         float t = 1f - MathF.Exp(-ScrollLerpSpeed * dt);
         _scrollOffset = Lerp(_scrollOffset, _targetScrollOffset, t);
@@ -76,7 +88,9 @@ sealed class ThumbnailStrip
     {
         if (!nav.HasFiles) return;
 
-        float stripY = windowHeight - StripHeight;
+        // Top of the strip band [stripY, stripY + StripHeight]; the BottomMargin
+        // below it stays empty so the strip clears the see-through taskbar area.
+        float stripY = windowHeight - ReservedHeight;
 
         // No background quad on purpose: the strip area keeps the same translucent
         // backdrop as the rest of the window and the thumbnails float on it.
@@ -99,19 +113,14 @@ sealed class ThumbnailStrip
             float cellCenterX = cellX + CellWidth * 0.5f;
             float cellCenterY = stripY + StripHeight * 0.5f;
 
-            // Fit thumbnail within the cell, preserving aspect ratio.
-            float aspect = (float)cached.Width / cached.Height;
-            float drawW, drawH;
-            if (aspect > 1f)
-            { drawW = ThumbSize; drawH = ThumbSize / aspect; }
-            else
-            { drawW = ThumbSize * aspect; drawH = ThumbSize; }
-
-            float drawX = cellCenterX - drawW * 0.5f;
-            float drawY = cellCenterY - drawH * 0.5f;
+            // Uniform 1:1 grid: the cache decodes every thumbnail as an exactly
+            // ThumbSize × ThumbSize square, drawn here at native size — with the
+            // rounded scroll offset the mapping is texel-per-pixel, no resampling.
+            float drawX = cellCenterX - ThumbSize * 0.5f;
+            float drawY = cellCenterY - ThumbSize * 0.5f;
 
             int cbSlot = CbSlotThumbStart + thumbsDrawn;
-            WriteRectConstants(cbSlot, drawX, drawY, drawW, drawH,
+            WriteRectConstants(cbSlot, drawX, drawY, ThumbSize, ThumbSize,
                 windowWidth, windowHeight, Vector4.Zero); // zero tint = use texture
 
             _res.DrawQuad(cached.SrvSlot, cbSlot);
@@ -183,7 +192,8 @@ sealed class ThumbnailStrip
     /// <summary>Set the scroll offset to immediately center the given index (no animation).</summary>
     public void SnapToIndex(int index, int windowWidth)
     {
-        float offset = windowWidth * 0.5f - index * CellWidth - CellWidth * 0.5f;
+        float offset = MathF.Round(
+            windowWidth * 0.5f - index * CellWidth - CellWidth * 0.5f);
         _scrollOffset = offset;
         _targetScrollOffset = offset;
     }
@@ -191,7 +201,9 @@ sealed class ThumbnailStrip
     /// <summary>Get the thumbnail index at a given screen position, or -1.</summary>
     public int HitTest(float screenX, float screenY, int windowWidth, int windowHeight, int fileCount)
     {
-        float stripY = windowHeight - StripHeight;
+        // The whole reserved bottom band counts, including the empty margin below
+        // the thumbnails — a slightly-too-low click still selects (forgiving target).
+        float stripY = windowHeight - ReservedHeight;
         if (screenY < stripY || screenY > windowHeight) return -1;
 
         int index = (int)MathF.Floor((screenX - _scrollOffset) / CellWidth);
