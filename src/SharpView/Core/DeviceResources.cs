@@ -4,7 +4,6 @@ using Vortice;
 using Vortice.D3DCompiler;
 using Vortice.Direct3D;
 using Vortice.Direct3D12;
-using Vortice.Direct3D12.Debug;
 using Vortice.DirectComposition;
 using Vortice.DXGI;
 using Vortice.Mathematics;
@@ -71,6 +70,10 @@ sealed unsafe class DeviceResources : IDisposable
     ulong _currentFenceValue = 1;
     AutoResetEvent _fenceEvent = null!;
     int _frameIndex;
+
+    // Current swap chain buffer size — lets Resize skip same-size requests
+    // (notably the post-Show verification of the pre-sized startup swap chain).
+    int _bufferWidth, _bufferHeight;
 
     // Constant buffer (one region of MaxCbSlots per frame in flight)
     ID3D12Resource _constantBuffer = null!;
@@ -143,6 +146,8 @@ sealed unsafe class DeviceResources : IDisposable
         using var tmp = factory.CreateSwapChainForComposition(CommandQueue, sd, null);
         SwapChain = tmp.QueryInterface<IDXGISwapChain3>();
         _frameIndex = (int)SwapChain.CurrentBackBufferIndex;
+        _bufferWidth = width;
+        _bufferHeight = height;
 
         // renderingDevice stays null on purpose: D3D12 exposes no IDXGIDevice, and
         // none is needed just to host swap chain content (no DComp surfaces here).
@@ -516,6 +521,12 @@ sealed unsafe class DeviceResources : IDisposable
     public void Resize(int width, int height)
     {
         if (width <= 0 || height <= 0) return;
+
+        // Same size? Nothing to rebuild — and skipping the full GPU wait is what
+        // keeps the pre-sized startup swap chain path completely stall-free.
+        // (Also dedupes spurious same-size Resize events at runtime.)
+        if (width == _bufferWidth && height == _bufferHeight) return;
+
         WaitForGpu();
 
         for (int i = 0; i < FrameCount; i++)
@@ -525,6 +536,9 @@ sealed unsafe class DeviceResources : IDisposable
             BackBufferFormat, SwapChainFlags.None);
         _frameIndex = (int)SwapChain.CurrentBackBufferIndex;
         CreateRenderTargets();
+
+        _bufferWidth = width;
+        _bufferHeight = height;
     }
 
     /// <summary>

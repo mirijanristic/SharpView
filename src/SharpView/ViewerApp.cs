@@ -48,8 +48,17 @@ sealed class ViewerApp : IDisposable
     public ViewerApp(string imagePath)
     {
         _initialImagePath = imagePath;
-        _width = 1400;
-        _height = 900;
+
+        // The window opens borderless-maximized, so its client area will be the
+        // FULL bounds of the screen it lands on. CenterScreen with no owner picks
+        // the screen containing the cursor (WinForms' CenterToScreen rule) — using
+        // the same rule here sizes the swap chain correctly before the window even
+        // exists, which turns the post-Show HandleResize into a no-op instead of a
+        // swap chain rebuild behind a full GPU wait. A wrong guess (cursor moved
+        // to another monitor mid-startup) simply falls back to a real resize.
+        var screenBounds = Screen.FromPoint(Cursor.Position).Bounds;
+        _width = screenBounds.Width;
+        _height = screenBounds.Height;
 
         _form = new ViewerForm
         {
@@ -59,7 +68,7 @@ sealed class ViewerApp : IDisposable
             // Alt+F4 closes. Prefer a normal framed window again? Delete this line
             // (it is set before ClientSize on purpose, so ClientSize is preserved).
             FormBorderStyle = FormBorderStyle.None,
-            ClientSize = new Size(_width, _height), // restored (un-maximized) size
+            ClientSize = new Size(1400, 900), // restored (un-maximized) size
             StartPosition = FormStartPosition.CenterScreen,
             WindowState = FormWindowState.Maximized, // start full screen
             BackColor = Color.FromArgb(18, 18, 18), // never visible (no GDI surface); kept for a framed fallback
@@ -137,9 +146,11 @@ sealed class ViewerApp : IDisposable
     {
         _form.Show();
 
-        // The window opens maximized, so the real client size is only known now:
-        // sync the swap chain to it and center the strip. The startup view for the
-        // image itself is applied in Update() the moment its (async) decode lands.
+        // The swap chain was already created at the predicted maximized size, so
+        // in the normal case this is a pure verification — DeviceResources skips
+        // same-size requests, no rebuild, no GPU wait. Real work happens only if
+        // the window landed somewhere unexpected. The startup view for the image
+        // itself is applied in Update() the moment its (async) decode lands.
         _needsResize = false;
         HandleResize();
         _thumbStrip.SnapToIndex(_nav.CurrentIndex, _width);
