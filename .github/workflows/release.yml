@@ -65,7 +65,7 @@ jobs:
           -p:DebugType=none
           -p:SatelliteResourceLanguages=en
           -p:Version=${{ steps.ver.outputs.version }}
-          -o publish-fd
+          -o publish
 
       # ----------------------------------------------------------------------
       # Meta 2: self-contained -> ide u portable ZIP.
