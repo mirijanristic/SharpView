@@ -76,7 +76,7 @@ sealed class ViewerApp : IDisposable
         };
 
         // Title-bar / Alt-Tab icon: reuse the icon embedded into the EXE via
-        // <ApplicationIcon>icon.ico</ApplicationIcon> in the .csproj, so icon.ico
+        // <ApplicationIcon>app.ico</ApplicationIcon> in the .csproj, so app.ico
         // does not need to ship next to the executable.
         try { _form.Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath); }
         catch { /* missing/odd icon resource — keep the default form icon */ }

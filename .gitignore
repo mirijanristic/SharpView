@@ -1,8 +1,9 @@
 # Build output
 bin/
 obj/
-publish/
+publish*/
 artifacts/
+dist/
 
 # IDE
 .vs/
@@ -18,3 +19,7 @@ TestResults/
 # OS
 Thumbs.db
 Desktop.ini
+
+# Signing / secrets
+*.pfx
+*.snk

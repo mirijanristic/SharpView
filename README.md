@@ -21,7 +21,7 @@ podređene tome.
 Potrebno: Windows 10/11 (x64), .NET 10 SDK, GPU sa D3D12 podrškom
 (feature level 12_0). Zavisnosti su Vortice.Windows paketi (Direct3D12, DXGI,
 D3DCompiler, Direct2D1 - u njemu žive WIC omotači), povlače se sa NuGet-a.
-Build očekuje `icon.ico` pored `SharpView.csproj`.
+Build očekuje `app.ico` pored `SharpView.csproj`.
 
     dotnet build -c Release
     dotnet run --project src/SharpView -c Release -- put/do/slike.jpg
