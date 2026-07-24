@@ -65,7 +65,7 @@ jobs:
           -p:DebugType=none
           -p:SatelliteResourceLanguages=en
           -p:Version=${{ steps.ver.outputs.version }}
-          -o publish
+          -o publish-fd
 
       # ----------------------------------------------------------------------
       # Meta 2: self-contained -> ide u portable ZIP.
@@ -106,9 +106,15 @@ jobs:
         shell: pwsh
         working-directory: dist
         run: |
-          Get-ChildItem -File -Exclude SHA256SUMS.txt | ForEach-Object {
-            "$((Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower())  $($_.Name)"
-          } | Out-File -Encoding ascii SHA256SUMS.txt
+          # Napomena: Get-ChildItem -Exclude bez wildcard putanje filtrira sam
+          # direktorijum umjesto sadrzaja i vraca prazno - zato Where-Object.
+          $lines = Get-ChildItem -File |
+            Where-Object Name -ne 'SHA256SUMS.txt' |
+            ForEach-Object {
+              "$((Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower())  $($_.Name)"
+            }
+          if (-not $lines) { throw 'dist je prazan - nema sta hesirati' }
+          $lines | Out-File -Encoding ascii SHA256SUMS.txt
           Get-Content SHA256SUMS.txt
 
       - name: Objavi release
