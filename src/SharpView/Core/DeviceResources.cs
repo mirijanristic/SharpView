@@ -102,6 +102,8 @@ sealed unsafe class DeviceResources : IDisposable
 
     public int WhiteSrvSlot => _whiteSrvSlot;
 
+    public bool IsWarp { get; private set; }
+
     public void Init(IntPtr hwnd, int width, int height)
     {
 #if DEBUG
@@ -115,11 +117,28 @@ sealed unsafe class DeviceResources : IDisposable
         {
             var desc = adapter.Description1;
             if ((desc.Flags & AdapterFlags.Software) != 0) { adapter.Dispose(); continue; }
-            if (D3D12.D3D12CreateDevice(adapter, FeatureLevel.Level_12_0, out device).Success)
-            { adapter.Dispose(); break; }
+            // 11_0 instead of 12_0: nothing in this app needs 12_0-only features,
+            // and this makes older FL 11 GPUs (Kepler, Haswell, GCN 1.0) work too.
+            if (D3D12.D3D12CreateDevice(adapter, FeatureLevel.Level_11_0, out device).Success)
+            { adapter.Dispose();  break; }
             adapter.Dispose();
         }
-        Device = device ?? D3D12.D3D12CreateDevice<ID3D12Device2>(null, FeatureLevel.Level_12_0);
+
+        // No hardware D3D12 adapter → WARP, the software D3D12 rasterizer that
+        // ships with every Windows 10+. Slow, but the app runs instead of crashing.
+        if (device is null)
+        {
+            try
+            {
+                using IDXGIAdapter warp = factory.EnumWarpAdapter<IDXGIAdapter>();
+                if (D3D12.D3D12CreateDevice(warp, FeatureLevel.Level_11_0, out device).Success)
+                    IsWarp = true;
+            }
+            catch { /* not even WARP is available */ }
+        }
+
+        Device = device ?? throw new NotSupportedException(
+            "This PC does not support Direct3D 12 (no capable GPU and no WARP fallback).");
 
         CommandQueue = Device.CreateCommandQueue(new CommandQueueDescription(CommandListType.Direct));
 

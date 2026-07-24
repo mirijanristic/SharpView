@@ -305,7 +305,8 @@ sealed class ViewerApp : IDisposable
     }
 
     void UpdateTitle()
-        => _form.Text = $"SharpView — {Path.GetFileName(_nav.CurrentFile)}  [{_nav.CurrentIndex + 1}/{_nav.Count}]";
+        => _form.Text = $"SharpView - {Path.GetFileName(_nav.CurrentFile)}  [{_nav.CurrentIndex + 1}/{_nav.Count}]"
+                        + (_res.IsWarp ? "  [software rendering]" : "");
 
     // ─── Input Handlers ───────────────────────────────────────────────
 
