@@ -41,6 +41,23 @@ sealed class ThumbnailStrip
     /// <summary>True when the scroll animation has reached its target.</summary>
     public bool IsSettled => _scrollOffset == _targetScrollOffset;
 
+    // ─── Auto-hide (mirrors TopBar: same fade, same thresholds) ────────
+    float _opacity;                   // animated 0..1
+    float _targetOpacity;             // 0 or 1
+    float _holdTimer = HoldSeconds;   // starts held: the strip shows itself at launch
+    /// <summary>How long the strip stays up after a show trigger (navigation).</summary>
+    const float HoldSeconds = 3f;
+    /// <summary>True once opaque enough to interact with (same bar semantics).</summary>
+    public bool IsStripVisible => _opacity > TopBar.VisibleThreshold;
+
+    /// <summary>True while the strip needs frames: fading, visible (cursor is
+    /// polled every frame to decide the fade-out), or holding after a trigger.</summary>
+    public bool WantsFrames => _opacity > 0f || _targetOpacity > 0f || _holdTimer > 0f;
+
+    /// <summary>Show the strip now and keep it up for <see cref="HoldSeconds"/> —
+    /// called on keyboard navigation so the strip narrates where you are.</summary>
+    public void Show() => _holdTimer = HoldSeconds;
+
     static readonly Vector4 SelectionColor = new(0.0f, 0.47f, 0.83f, 1.0f); // #0078D4
 
     // Constant buffer slot layout (slot 0 belongs to ImageRenderer):
@@ -60,10 +77,26 @@ sealed class ThumbnailStrip
         _cache = cache;
     }
 
-    /// <summary>Update scroll animation and request thumbnail loading.</summary>
-    public void Update(float dt, int windowWidth, int windowHeight, ImageNavigator nav)
+    /// <summary>Update scroll/fade animation and request thumbnail loading.</summary>
+    public void Update(float dt, int windowWidth, int windowHeight,
+                       int cursorY, bool cursorAvailable, ImageNavigator nav)
     {
         if (!nav.HasFiles) return;
+
+        if (_holdTimer > 0f) _holdTimer -= dt;
+
+        // The reveal zone is the WHOLE band area, hidden or visible — unlike the
+        // top bar there is no thin-trigger special case: the band sits where a
+        // toolbar visually belongs, so entering that area is always intent.
+        bool inZone = cursorAvailable
+            && cursorY >= windowHeight - ReservedHeight && cursorY < windowHeight;
+
+        _targetOpacity = inZone || _holdTimer > 0f ? 1f : 0f;
+
+        float fade = 1f - MathF.Exp(-TopBar.FadeSpeed * dt);
+        _opacity += (_targetOpacity - _opacity) * fade;
+        if (MathF.Abs(_opacity - _targetOpacity) < 0.005f)
+            _opacity = _targetOpacity; // snap → lets the render loop go idle
 
         // Center the current thumbnail. Rounded to a whole pixel: with an integer
         // offset every derived cell/border coordinate is integral too, so settled
@@ -93,6 +126,7 @@ sealed class ThumbnailStrip
     public void Render(int windowWidth, int windowHeight, ImageNavigator nav)
     {
         if (!nav.HasFiles) return;
+        if (_opacity <= 0.004f) return; // fully faded out — draw nothing
 
         // Top of the strip band [stripY, stripY + StripHeight]; the BottomMargin
         // below it stays empty so the strip clears the see-through taskbar area.
@@ -190,6 +224,7 @@ sealed class ThumbnailStrip
         {
             Transform = Matrix4x4.Transpose(xform),
             TintColor = tintColor,
+            Misc = new Vector4(_opacity, 0f, 0f, 0f), // the whole strip fades as one
         });
     }
 
@@ -212,6 +247,9 @@ sealed class ThumbnailStrip
     /// <summary>Get the thumbnail index at a given screen position, or -1.</summary>
     public int HitTest(float screenX, float screenY, int windowWidth, int windowHeight, int fileCount)
     {
+        // Faded out = nothing visible, nothing clickable (hovering the zone
+        // fades the strip in first, so real clicks always land on a visible one).
+        if (!IsStripVisible) return -1;
         // The whole reserved bottom band counts, including the empty margin below
         // the thumbnails — a slightly-too-low click still selects (forgiving target).
         float stripY = windowHeight - ReservedHeight;

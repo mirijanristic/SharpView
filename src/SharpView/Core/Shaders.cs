@@ -14,6 +14,7 @@ static class Shaders
         {
             float4x4 Transform;
             float4 TintColor;
+            float4 Misc; // x = opacity; 0 means unset -> fully opaque (see ViewConstants)
         };
 
         Texture2D    gTex     : register(t0);
@@ -32,17 +33,21 @@ static class Shaders
 
         float4 PSMain(PSIn p) : SV_TARGET
         {
+            // Draw opacity (strip/bar fades). Output is premultiplied, so one
+            // scalar multiply on the whole premultiplied color fades correctly.
+            float op = Misc.x <= 0.0 ? 1.0 : saturate(Misc.x);
+
             // Solid color mode (UI rectangles). TintColor.a doubles as the mode
             // flag AND the actual opacity, so translucent UI like the glassy
             // thumbnail strip background works too.
             if (TintColor.a > 0.001)
-                return float4(TintColor.rgb * TintColor.a, TintColor.a);
+                return float4(TintColor.rgb * TintColor.a, TintColor.a) * op;
 
             // Image mode: texels are straight alpha, premultiply here. Transparent
             // PNG/GIF regions now genuinely show the live desktop through the
             // window — the old in-shader checkerboard is gone on purpose.
             float4 t = gTex.Sample(gSampler, p.uv);
-            return float4(t.rgb * t.a, t.a);
+            return float4(t.rgb * t.a, t.a) * op;
         }
     ";
 }

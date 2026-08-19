@@ -194,6 +194,7 @@ sealed class ViewerApp : IDisposable
         || _needsResize
         || !_imageRenderer.IsAnimationSettled
         || !_thumbStrip.IsSettled
+        || _thumbStrip.WantsFrames // visible/fading/holding strip polls the cursor
         || _topBar.WantsFrames // visible/fading bar polls the cursor each frame
         || _imageRenderer.IsBusy
         || _thumbCache.IsBusy
@@ -235,19 +236,20 @@ sealed class ViewerApp : IDisposable
                 "SharpView", NativeMethods.MB_OK | NativeMethods.MB_ICONWARNING);
         }
 
-        _imageRenderer.Update(dt, _width, _height);
-        _thumbStrip.Update(dt, _width, _height, _nav);
-
-        // Hover top bar: polled rather than event-driven, because its caption zone
-        // produces no client WM_MOUSEMOVE and the mouse can leave the window
-        // sideways (toward the other monitor) without any message at all. Hidden
-        // while dragging so the bar stays out of the way of a pan near the top edge.
-        // Deliberately NOT gated on window focus: mouse hover follows position,
-        // not activation (WM_NCMOUSEMOVE arrives and wakes the loop either way),
-        // and unfocused-hover feedback is standard Windows behavior — Explorer
-        // and Chrome light up controls on inactive windows too.
+        // Cursor is polled rather than event-driven for BOTH overlays: the top
+        // bar's caption zone produces no client WM_MOUSEMOVE, and the mouse can
+        // leave the window sideways (toward the other monitor) without any
+        // message at all. Hidden while dragging so neither bar gets in the way
+        // of a pan near an edge. Deliberately NOT gated on window focus: mouse
+        // hover follows position, not activation (WM_NCMOUSEMOVE arrives and
+        // wakes the loop either way), and unfocused-hover feedback is standard
+        // Windows behavior — Explorer and Chrome light up controls on inactive
+        // windows too.
         _window.GetCursorClientPosition(out int cx, out int cy, out bool insideClient);
         bool cursorAvailable = !_dragging && insideClient;
+
+        _imageRenderer.Update(dt, _width, _height);
+        _thumbStrip.Update(dt, _width, _height, cy, cursorAvailable, _nav);
         _topBar.Update(dt, _width, cx, cy, cursorAvailable, _window.IsMaximized);
     }
 
@@ -490,6 +492,10 @@ sealed class ViewerApp : IDisposable
 
     void NavigateToImage()
     {
+        // Navigation narrates through the strip: show it and hold it up for a
+        // few seconds so arrow-key browsing always has the filmstrip context.
+        _thumbStrip.Show();
+
         // Non-blocking: decode happens on the thread pool (or is skipped entirely
         // when the image was prefetched), the upload on a later frame.
         _imageRenderer.LoadImageAsync(_nav.CurrentFile);
@@ -570,10 +576,14 @@ sealed class ViewerApp : IDisposable
     {
         if (!_dragging)
         {
-            // Near the top edge? Give the bar's hover logic a frame to run (its
-            // trigger zone is mostly caption, but the X area is client — and this
-            // also catches re-entry from just below the bar).
-            if (y < TopBar.BarHeight) Wake();
+            // Near the top or bottom edge? Give the overlays' hover logic a
+            // frame to run — when everything is idle the render loop SLEEPS, so
+            // without this wake the polled hover detection simply never
+            // executes and the bars refuse to appear until something else
+            // happens to wake the loop. (Top zone is mostly caption but the X
+            // area is client; bottom zone is the whole strip band.)
+            if (y < TopBar.BarHeight || y >= _height - ThumbnailStrip.ReservedHeight)
+                Wake();
             return;
         }
         float dx = x - _lastMouseX, dy = y - _lastMouseY;

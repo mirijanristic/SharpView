@@ -22,8 +22,11 @@ sealed class TopBar
     /// <see cref="BarHeight"/> instead: exactly where a title bar would be.</summary>
     public const int TriggerHeight = 8;
     const int CloseWidth = 46;           // close button hit rect (right-aligned)
-    const float FadeSpeed = 12f;         // exponential fade rate, 1/s
-    const float VisibleThreshold = 0.5f; // the X becomes clickable above this
+    /// <summary>Exponential fade rate (1/s) — shared with the thumbnail strip
+    /// so both overlays animate identically.</summary>
+    internal const float FadeSpeed = 12f;
+    /// <summary>Interactivity threshold — shared with the thumbnail strip.</summary>
+    internal const float VisibleThreshold = 0.5f;
     const float StartupReveal = 1.6f;    // seconds the bar shows itself after launch
 
     // Constant buffer slots: 0 = ImageRenderer, 1..36 = ThumbnailStrip, then ours.
