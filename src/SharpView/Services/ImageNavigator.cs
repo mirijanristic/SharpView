@@ -7,7 +7,8 @@ sealed class ImageNavigator
 {
     // Base set is always decodable (WIC or the GDI+ fallback). WebP and HEIC are
     // added at runtime only when the corresponding WIC codec extension is installed
-    // on this machine, so no silently-failing entries ever appear in the strip.
+    // on this machine, and RAW extensions only when the bundled LibRaw dll loaded,
+    // so no silently-failing entries ever appear in the strip.
     static readonly HashSet<string> SupportedExtensions = BuildSupportedExtensions();
 
     static HashSet<string> BuildSupportedExtensions()
@@ -18,6 +19,10 @@ sealed class ImageNavigator
         };
         if (ImageDecoder.SupportsWebp) set.Add(".webp");
         if (ImageDecoder.SupportsHeif) { set.Add(".heic"); set.Add(".heif"); }
+        if (ImageDecoder.SupportsRaw)
+        {
+            foreach (string ext in ImageDecoder.RawExtensions) set.Add(ext);
+        }
         return set;
     }
 

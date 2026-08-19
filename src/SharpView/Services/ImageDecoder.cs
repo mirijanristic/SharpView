@@ -18,6 +18,10 @@ namespace SharpView.Services;
 /// Windows codec extensions are installed. If WIC fails for any reason, the
 /// original GDI+ (System.Drawing) path below is used automatically, so behavior
 /// can only improve, never regress.
+/// Camera RAW files (<see cref="RawDecoder"/>) are routed by extension to
+/// LibRaw before that chain; if LibRaw is unavailable or fails, the same
+/// WIC→GDI+ fallback runs (WIC can still succeed when the Microsoft "Raw Image
+/// Extension" happens to be installed).
 /// BGRA output matches <see cref="Core.DeviceResources.TextureFormat"/>, so pixels
 /// are uploaded with straight memcpy — no per-pixel channel swizzle.
 /// </remarks>
@@ -29,6 +33,15 @@ static unsafe class ImageDecoder
     /// <summary>True when .heic/.heif is decodable on this machine (WIC + "HEIF Image Extensions").</summary>
     public static bool SupportsHeif => WicDecoder.HasHeif;
 
+    /// <summary>True when camera RAW files are decodable (bundled LibRaw dll loaded).</summary>
+    public static bool SupportsRaw => RawDecoder.IsAvailable;
+
+    /// <summary>RAW extensions handled by <see cref="RawDecoder"/> (currently .nef).</summary>
+    public static IReadOnlyList<string> RawExtensions => RawDecoder.Extensions;
+
+    static bool IsRawFile(string path)
+        => RawDecoder.IsAvailable && RawDecoder.HandlesExtension(Path.GetExtension(path));
+
     /// <summary>
     /// Decodes an image file into tightly packed BGRA pixel bytes. Returns dimensions
     /// via out params. Optionally resizes to fit within <paramref name="maxDimension"/>.
@@ -37,6 +50,19 @@ static unsafe class ImageDecoder
     public static byte[] DecodeToBgra(string path, out int width, out int height,
                                       int maxDimension = 0, bool lowQuality = false)
     {
+        if (IsRawFile(path))
+        {
+            try
+            {
+                return RawDecoder.DecodeToBgra(path, out width, out height,
+                                               maxDimension, lowQuality);
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"[ImageDecoder] LibRaw failed for '{path}', falling back: {ex.Message}");
+            }
+        }
+
         if (WicDecoder.IsAvailable)
         {
             try
@@ -61,6 +87,18 @@ static unsafe class ImageDecoder
     /// </summary>
     public static byte[] DecodeSquareBgra(string path, int size)
     {
+        if (IsRawFile(path))
+        {
+            try
+            {
+                return RawDecoder.DecodeSquareBgra(path, size);
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"[ImageDecoder] LibRaw square decode failed for '{path}', falling back: {ex.Message}");
+            }
+        }
+
         if (WicDecoder.IsAvailable)
         {
             try

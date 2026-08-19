@@ -24,7 +24,11 @@ internal static class FileAssociations
 
     public static readonly string[] Extensions =
     {
-        ".bmp", ".gif", ".jpeg", ".jpg", ".png", ".tif", ".tiff"
+        ".bmp", ".gif", ".jpeg", ".jpg", ".png", ".tif", ".tiff",
+        // RAW: unlike WebP/HEIC there is no external-codec dependency to detect —
+        // the LibRaw dll ships next to the exe (NuGet runtime package), so the
+        // association is registered unconditionally.
+        ".nef"
     };
 
     public static void Register()

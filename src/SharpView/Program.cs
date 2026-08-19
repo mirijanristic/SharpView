@@ -40,6 +40,8 @@ internal static class Program
                 string exts = "*.png;*.jpg;*.jpeg;*.bmp;*.gif;*.tif;*.tiff";
                 if (ImageDecoder.SupportsWebp) exts += ";*.webp";
                 if (ImageDecoder.SupportsHeif) exts += ";*.heic;*.heif";
+                if (ImageDecoder.SupportsRaw)
+                    exts += ";" + string.Join(';', ImageDecoder.RawExtensions.Select(e => "*" + e));
 
                 using var ofd = new OpenFileDialog
                 {

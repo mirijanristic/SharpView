@@ -29,6 +29,13 @@
     <!-- DirectComposition hosting of the composition swap chain (per-pixel window alpha). -->
     <PackageReference Include="Vortice.DirectComposition" Version="3.8.2" />
     <PackageReference Include="Vortice.Mathematics" Version="2.1.0" />
+
+    <!-- LibRaw native binaries for camera RAW decoding (RawDecoder): raw_r.dll
+         (thread-safe LibRaw 0.21.1 build) + lcms2/zlib1/jpeg8 dependencies. The
+         package's targets copy the dlls next to the exe — no manual steps.
+         License note: the native binaries are LGPL-2.1-only OR CDDL-1.0
+         (dynamically linked, compatible with this project's MIT license). -->
+    <PackageReference Include="Sdcb.LibRaw.runtime.win64" Version="0.21.1.7" />
   </ItemGroup>
 
   <ItemGroup>

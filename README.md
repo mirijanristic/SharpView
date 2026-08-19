@@ -20,7 +20,9 @@ podređene tome.
 
 Potrebno: Windows 10/11 (x64), .NET 10 SDK, GPU sa D3D12 podrškom
 (feature level 12_0). Zavisnosti su Vortice.Windows paketi (Direct3D12, DXGI,
-D3DCompiler, Direct2D1 - u njemu žive WIC omotači), povlače se sa NuGet-a.
+D3DCompiler, Direct2D1 - u njemu žive WIC omotači) i
+`Sdcb.LibRaw.runtime.win64` (LibRaw native binarke za RAW formate — `raw_r.dll`
+i prateće dll-ove build sam kopira pored exe-a), sve se povlači sa NuGet-a.
 Build očekuje `app.ico` pored `SharpView.csproj`.
 
     dotnet build -c Release
@@ -64,10 +66,13 @@ kod fajlova od više stotina megabajta.
     │   ├── Core/        DeviceResources (uređaj, swap chain, PSO, fence, deferred release),
     │   │                Shaders, TextureUploader, Vertex, ViewConstants
     │   ├── Rendering/   ImageRenderer (glavna slika + prefetch), ThumbnailStrip, ZoomPanController
-    │   ├── Services/    ImageDecoder (WIC + GDI+ fallback), WicDecoder, ImageNavigator, ThumbnailCache
+    │   ├── Services/    ImageDecoder (RAW + WIC + GDI+ fallback), WicDecoder, RawDecoder,
+    │   │                LibRawNative, TiffOrientation, PixelOrientation,
+    │   │                ImageNavigator, ThumbnailCache
     │   ├── Platform/    FileAssociations (HKCU registry), WindowStyling (DWM stilizacija)
     │   └── ViewerApp.cs / ViewerForm.cs / Program.cs
-    └── tests/SharpView.Tests/    14 unit testova (ZoomPanController, ImageNavigator)
+    └── tests/SharpView.Tests/    unit testovi (ZoomPanController, ImageNavigator,
+                                  TiffOrientation, PixelOrientation)
 
 Cijeli prikaz je jedan shader par i jedan quad: glavna slika, thumbnailovi i
 UI pravougaonici (pozadina stripa, okvir selekcije) crtaju se istim
@@ -138,14 +143,45 @@ Extensions", odnosno "HEIF Image Extensions"; za HEVC-kodiran HEIC dodatno i
 HEVC kodek). Detekcija je runtime: ekstenzije se pojavljuju u navigaciji i
 dijalogu samo kad stvarno rade, pa nema tihih promašaja.
 
+### RAW (NEF)
+
+Nikon NEF se dekodira kroz bundlovan **LibRaw** (`raw_r.dll`, thread-safe
+build iz `Sdcb.LibRaw.runtime.win64` paketa). Politika je *preview-first*:
+iz RAW-a se izvuče JPEG preview koji kamera ugrađuje (obično puna rezolucija)
+i dekodira kroz postojeći WIC put — čita se samo JPEG blok, senzorski podaci
+se ne diraju, pa je otvaranje reda milisekundi umjesto sekundi. Pravi demozaik
+(LibRaw dcraw pipeline, kamera WB preko `cam_mul`) radi samo kao fallback kad
+upotrebljiv preview ne postoji, što je kod NEF-a praktično nikad.
+
+EXIF orijentacija radi za RAW od prvog dana: NEF je TIFF kontejner, pa se
+Orientation tag čita iz IFD0 (vlastiti mini čitač, nezavisan od verzije
+LibRaw-a) i primijeni na piksele; demozaik put rotaciju dobija besplatno jer
+je LibRaw sam primjenjuje. Napomena o bojama: preview je kamerin JPEG
+rendering (picture control, izoštravanje), pa se od "sirovog" demozaika može
+minimalno razlikovati — za preglednik je to poželjno, slika izgleda kao na
+poleđini aparata.
+
+LibRaw sloj je format-agnostičan (LibRaw fajl prepoznaje po sadržaju, ne po
+ekstenziji), pa je plan širenja: NRW (isti Nikon pipeline), zatim DNG (TIFF —
+orijentacija već pokrivena), pa RAF (Fuji: nije TIFF, orijentacija ide iz
+EXIF-a ugrađenog JPEG-a; X-Trans demozaik fallback je osjetno skuplji).
+Licenca: native binarke su LGPL-2.1-only OR CDDL-1.0 (dinamičko linkovanje,
+kompatibilno sa MIT licencom projekta).
+
 ## TODO
 
 - [ ] **Mipmape za glavnu sliku** — CPU generisanje mip lanca tokom
   background dekodiranja + upload svih nivoa; uklanja treperenje i moiré na
   fit prikazu velikih fotografija i vraća smisao anizotropnom filtriranju.
   Najveći preostali golim okom vidljiv dobitak.
+- [ ] **Formati** — Dodaj nove formate, ukljucujuci .ico i formate za iphone,
+  i .raw formate — **djelimično: NEF gotov (LibRaw)**; slijede NRW, DNG, RAF
+  (dodavanje ekstenzije + test po formatu, vidi `RawDecoder`).
+- [ ] Windows 10 ne radi associate files u exe setup
 - [ ] **EXIF orijentacija** — auto-rotacija fotografija sa telefona; bez nje
-  se portretni snimci prikazuju položeni na bok.
+  se portretni snimci prikazuju položeni na bok. **Djelimično: za RAW (NEF)
+  urađeno** (`TiffOrientation` + `PixelOrientation`); ostaje primjena istog
+  mehanizma na JPEG/TIFF put.
 - [ ] Sortiranje po datumu (i veličini) pored abecednog.
 - [ ] Borderless fullscreen (F11) bez naslovne trake.
 

@@ -11,12 +11,19 @@ namespace SharpView.Services;
 /// scaler, when attached directly to the decoder frame, lets codecs that implement
 /// <c>IWICBitmapSourceTransform</c> (JPEG) decode straight to the requested size
 /// via native DCT-domain scaling instead of decoding every pixel first.
-/// Also provides runtime detection of optional codecs (WebP, HEIF/HEIC).
+/// Also provides runtime detection of optional codecs (WebP, HEIF/HEIC), and
+/// decode-from-memory overloads used by the RAW path (embedded preview JPEGs
+/// arrive as byte arrays, not files).
 /// </summary>
 /// <remarks>
 /// A factory is created per call: WIC objects are not thread-safe, and decodes run
 /// concurrently on the thread pool (main image, prefetch, thumbnails). Factory
 /// creation is trivially cheap next to an actual image decode.
+/// Memory-based decoding goes through <c>CreateDecoderFromStream(Stream)</c>: the
+/// decoder wrapper owns the WIC stream, which in turn keeps the managed stream
+/// proxy alive for the whole decode (Vortice ≥ 3.7.4 lifetime handling), so no
+/// pinned-buffer games are needed. The <c>MemoryStream</c> is declared before the
+/// decoder in each method, guaranteeing it outlives the decoder's disposal.
 /// </remarks>
 static class WicDecoder
 {
@@ -76,6 +83,105 @@ static class WicDecoder
         using var factory = new IWICImagingFactory();
         using var decoder = factory.CreateDecoderFromFileName(
             path, FileAccess.Read, DecodeOptions.CacheOnDemand);
+        return DecodeFirstFrame(factory, decoder, out width, out height,
+                                maxDimension, lowQuality);
+    }
+
+    /// <summary>
+    /// Decode an in-memory image (any WIC-supported container; in practice the
+    /// JPEG previews extracted from RAW files) to tightly packed 32bpp BGRA.
+    /// </summary>
+    public static byte[] DecodeToBgra(byte[] data, out int width, out int height,
+                                      int maxDimension = 0, bool lowQuality = false)
+    {
+        using var factory = new IWICImagingFactory();
+        using var stream = new MemoryStream(data, writable: false);
+        using var decoder = factory.CreateDecoderFromStream(stream, DecodeOptions.CacheOnDemand);
+        return DecodeFirstFrame(factory, decoder, out width, out height,
+                                maxDimension, lowQuality);
+    }
+
+    /// <summary>
+    /// Reads the pixel dimensions of an in-memory image without decoding any
+    /// pixels (header parse only). Used to size-gate RAW previews cheaply.
+    /// </summary>
+    public static bool TryGetImageSize(byte[] data, out int width, out int height)
+    {
+        width = height = 0;
+        try
+        {
+            using var factory = new IWICImagingFactory();
+            using var stream = new MemoryStream(data, writable: false);
+            using var decoder = factory.CreateDecoderFromStream(stream, DecodeOptions.CacheOnDemand);
+            using var frame = decoder.GetFrame(0);
+            var size = frame.Size;
+            width = size.Width;
+            height = size.Height;
+            return width > 0 && height > 0;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Decode an image straight into an exactly <paramref name="size"/>×<paramref name="size"/>,
+    /// center-cropped ("cover") 32bpp BGRA square. The scaler again sits directly on
+    /// the frame, so JPEG prescales natively, and always uses Fant filtering —
+    /// proper prefiltered downscaling is what makes small thumbnails look clean
+    /// instead of aliased (Linear only ever samples 2×2 source pixels, so at large
+    /// ratios it effectively point-samples). Sources smaller than the square are
+    /// scaled up to fill it, keeping the thumbnail grid uniform.
+    /// </summary>
+    public static byte[] DecodeSquareBgra(string path, int size)
+    {
+        using var factory = new IWICImagingFactory();
+        using var decoder = factory.CreateDecoderFromFileName(
+            path, FileAccess.Read, DecodeOptions.CacheOnDemand);
+        using var frame = decoder.GetFrame(0);
+
+        var srcSize = frame.Size;
+        return SquareFromSource(factory, frame, srcSize.Width, srcSize.Height, size);
+    }
+
+    /// <summary>
+    /// Cover-cropped square from an in-memory image (RAW preview JPEG →
+    /// thumbnail-strip square, with the same native JPEG prescale as the file path).
+    /// </summary>
+    public static byte[] DecodeSquareBgra(byte[] data, int size)
+    {
+        using var factory = new IWICImagingFactory();
+        using var stream = new MemoryStream(data, writable: false);
+        using var decoder = factory.CreateDecoderFromStream(stream, DecodeOptions.CacheOnDemand);
+        using var frame = decoder.GetFrame(0);
+
+        var srcSize = frame.Size;
+        return SquareFromSource(factory, frame, srcSize.Width, srcSize.Height, size);
+    }
+
+    /// <summary>
+    /// Cover-cropped square from raw BGRA pixels already in memory (RAW bitmap
+    /// previews and demosaic output). Runs the identical Fant scale → center clip
+    /// pipeline, so RAW thumbnails match the quality of every other thumbnail.
+    /// </summary>
+    internal static byte[] SquareFromBgraPixels(byte[] bgra, int width, int height, int size)
+    {
+        using var factory = new IWICImagingFactory();
+        // WICCreateBitmapFromMemory copies the pixels into the WIC bitmap, so the
+        // managed array's lifetime doesn't matter past this call.
+        using var bitmap = factory.CreateBitmapFromMemory(
+            (uint)width, (uint)height, WicPixelFormat.Format32bppBGRA,
+            bgra, (uint)(width * 4));
+        return SquareFromSource(factory, bitmap, width, height, size);
+    }
+
+    // ─── Shared cores ──────────────────────────────────────────────────
+
+    static byte[] DecodeFirstFrame(IWICImagingFactory factory, IWICBitmapDecoder decoder,
+                                   out int width, out int height,
+                                   int maxDimension, bool lowQuality)
+    {
         using var frame = decoder.GetFrame(0);
 
         var size = frame.Size;
@@ -124,25 +230,9 @@ static class WicDecoder
         }
     }
 
-    /// <summary>
-    /// Decode an image straight into an exactly <paramref name="size"/>×<paramref name="size"/>,
-    /// center-cropped ("cover") 32bpp BGRA square. The scaler again sits directly on
-    /// the frame, so JPEG prescales natively, and always uses Fant filtering —
-    /// proper prefiltered downscaling is what makes small thumbnails look clean
-    /// instead of aliased (Linear only ever samples 2×2 source pixels, so at large
-    /// ratios it effectively point-samples). Sources smaller than the square are
-    /// scaled up to fill it, keeping the thumbnail grid uniform.
-    /// </summary>
-    public static byte[] DecodeSquareBgra(string path, int size)
+    static byte[] SquareFromSource(IWICImagingFactory factory, IWICBitmapSource source,
+                                   int srcW, int srcH, int size)
     {
-        using var factory = new IWICImagingFactory();
-        using var decoder = factory.CreateDecoderFromFileName(
-            path, FileAccess.Read, DecodeOptions.CacheOnDemand);
-        using var frame = decoder.GetFrame(0);
-
-        var srcSize = frame.Size;
-        int srcW = srcSize.Width, srcH = srcSize.Height;
-
         // Cover: scale so the SHORT side lands exactly on `size` (the long side
         // overshoots), then clip the centered square out of the overshoot.
         float scale = Math.Max((float)size / srcW, (float)size / srcH);
@@ -150,7 +240,7 @@ static class WicDecoder
         int scaledH = Math.Max(size, (int)MathF.Round(srcH * scale));
 
         using var scaler = factory.CreateBitmapScaler();
-        scaler.Initialize(frame, (uint)scaledW, (uint)scaledH, BitmapInterpolationMode.Fant);
+        scaler.Initialize(source, (uint)scaledW, (uint)scaledH, BitmapInterpolationMode.Fant);
 
         using var clipper = factory.CreateBitmapClipper();
         clipper.Initialize(scaler, new RectI(
