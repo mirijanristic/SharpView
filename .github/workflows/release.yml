@@ -84,10 +84,16 @@ jobs:
           New-Item -ItemType Directory -Force -Path portable, dist | Out-Null
           Copy-Item publish\* portable\ -Recurse -Exclude *.pdb
 
-          $redist = "${env:ProgramFiles}\Microsoft Visual Studio\2022\*\VC\Redist\MSVC\*\x64"
-          $crt = Get-ChildItem "$redist\Microsoft.VC14*.CRT"    -Directory | Sort-Object FullName | Select-Object -Last 1
-          $omp = Get-ChildItem "$redist\Microsoft.VC14*.OpenMP" -Directory | Sort-Object FullName | Select-Object -Last 1
-          if (-not $crt -or -not $omp) { throw "VC++ redist folderi nisu nadjeni na runneru - provjeri putanju: $redist" }
+          # VS lociramo preko vswhere (fiksna putanja "...\2022" puca kad GitHub
+          # osvjezi runner image na noviju verziju Visual Studija).
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vsRoot = & $vswhere -latest -products * -property installationPath
+          if (-not $vsRoot) { throw "vswhere nije nasao Visual Studio na runneru" }
+
+          $redist = Join-Path $vsRoot 'VC\Redist\MSVC'
+          $crt = Get-ChildItem "$redist\*\x64\Microsoft.VC1*.CRT"    -Directory | Sort-Object FullName | Select-Object -Last 1
+          $omp = Get-ChildItem "$redist\*\x64\Microsoft.VC1*.OpenMP" -Directory | Sort-Object FullName | Select-Object -Last 1
+          if (-not $crt -or -not $omp) { throw "VC++ redist folderi nisu nadjeni pod: $redist" }
           Copy-Item "$($crt.FullName)\vcruntime140.dll",
                     "$($crt.FullName)\vcruntime140_1.dll",
                     "$($crt.FullName)\msvcp140.dll" portable\
