@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Numerics;
 using SharpView.Platform;
 using SharpView.Rendering;
 using SharpView.Services;
@@ -17,6 +18,14 @@ sealed class ViewerApp : IDisposable
     int _width, _height;
 
     readonly Core.DeviceResources _res = new();
+
+    // Frozen-geometry resize: the OS window is parked at the gesture's maximal
+    // bounds while the content renders at this offset with the apparent size in
+    // _width/_height. Both offsets are 0 outside the gesture, so every viewport
+    // below degenerates to the classic (0, 0, w, h).
+    bool _frozenResize;
+    int _viewOffsetX, _viewOffsetY;
+    const int CbSlotVeil = 42; // after ImageRenderer's underlay slot (41)
     readonly ImageNavigator _nav = new();
     ImageRenderer _imageRenderer = null!;
     ThumbnailStrip _thumbStrip = null!;
@@ -69,6 +78,9 @@ sealed class ViewerApp : IDisposable
         _window.Resized += () => { _needsResize = true; Wake(); };
         _window.LiveResize = OnLiveResize;
         _window.SizeMoveEnded = () => _res.EndLiveResize();
+        _window.FrozenResizeBegin = OnFrozenResizeBegin;
+        _window.FrozenResizeTick = OnFrozenResizeTick;
+        _window.FrozenResizeEnd = OnFrozenResizeEnd;
         _window.CloseRequested += () => _running = false;
         _window.MouseWheel = OnMouseWheel;
         _window.MouseDown = OnMouseDown;
@@ -271,16 +283,22 @@ sealed class ViewerApp : IDisposable
             }
         }
 
+        // Frozen resize: the clear left the whole buffer transparent; put the
+        // veil back over exactly the apparent window rect.
+        if (_frozenResize)
+            DrawFrozenVeil();
+
         // Main image (from the top of the window down to the strip band; the
-        // hover top bar is drawn later as an overlay on top of it)
-        _res.SetViewportAndScissor(0, 0, _width, MainViewHeight);
+        // hover top bar is drawn later as an overlay on top of it). The view
+        // offsets are non-zero only during the frozen-resize gesture.
+        _res.SetViewportAndScissor(_viewOffsetX, _viewOffsetY, _width, MainViewHeight);
         _imageRenderer.Render();
 
-        // Thumbnail strip (full-window viewport for pixel-coordinate rendering)
-        _res.SetViewportAndScissor(0, 0, _width, _height);
+        // Thumbnail strip (window-sized viewport for pixel-coordinate rendering)
+        _res.SetViewportAndScissor(_viewOffsetX, _viewOffsetY, _width, _height);
         _thumbStrip.Render(_width, _height, _nav);
 
-        // Hover top bar — drawn last, overlays the image (full-window viewport).
+        // Hover top bar — drawn last, overlays the image (window-sized viewport).
         _topBar.Render(_width, _height);
 
         _res.EndFrame();
@@ -288,6 +306,10 @@ sealed class ViewerApp : IDisposable
 
     void HandleResize()
     {
+        // During the frozen gesture the OS client is the PARKED rect; letting it
+        // through would overwrite the apparent size the gesture maintains.
+        if (_frozenResize) return;
+
         _window.GetClientSize(out int w, out int h);
         if (w <= 0 || h <= 0) return;
 
@@ -341,6 +363,121 @@ sealed class ViewerApp : IDisposable
         _res.WaitForGpu();
 
         Wake(); // a few follow-up frames once the loop resumes
+    }
+
+    /// <summary>
+    /// Frozen-resize gesture start. Called synchronously from the WndProc with
+    /// the parked buffer size and the content's initial offset; the parked
+    /// window geometry is applied right after this returns, so the frame must
+    /// be presented AND complete here — content first, geometry second.
+    /// </summary>
+    void OnFrozenResizeBegin(int bufferW, int bufferH,
+                             int offsetX, int offsetY, int width, int height)
+    {
+        if (_imageRenderer is null) return;
+
+        // 1) Warm-up frame in the CURRENT state — identical pixels, so it can
+        //    never be seen "wrong". After ~20 s idling behind another window
+        //    the first render costs extra (GPU clock ramp, caches, DWM
+        //    re-engagement); pay that here, while nothing is changing yet.
+        Update();
+        RenderFrame();
+        _res.WaitForGpu();
+
+        // 2) Phase-align the transition: DwmFlush returns right AFTER a
+        //    composition, so everything below — the offset frame, its GPU
+        //    wait, and the parked SetWindowPos the window applies the moment
+        //    we return — lands inside ONE composition interval. The next
+        //    composition then sees the new frame and the new geometry
+        //    TOGETHER; no instant is left for DWM to sample the transition
+        //    halfway (the rare whole-window flash at edge grab, likeliest
+        //    right after refocus, when activation itself schedules an extra
+        //    composition).
+        NativeMethods.DwmFlush();
+
+        _frozenResize = true;
+        _res.ClearTransparent = true; // outside the apparent rect = invisible
+        _viewOffsetX = offsetX;
+        _viewOffsetY = offsetY;
+
+        // Sticky buffers: reallocates at most ONCE per session per reached
+        // size — and even that first reallocation is now phase-aligned, so its
+        // empty-visual gap is re-filled before the next composition.
+        _res.Resize(bufferW, bufferH);
+        _width = width;
+        _height = height;
+
+        Update();
+        RenderFrame();
+        _res.WaitForGpu();
+        Wake();
+    }
+
+    /// <summary>
+    /// Frozen-resize mouse tick: pure state change — no geometry, no swap chain
+    /// work, no synchronous render. The normal render loop (running freely,
+    /// since there is no modal system loop) draws it at full pace; this is why
+    /// the left edge now costs exactly as much as the right one.
+    /// </summary>
+    void OnFrozenResizeTick(int offsetX, int offsetY, int width, int height)
+    {
+        _viewOffsetX = offsetX;
+        _viewOffsetY = offsetY;
+        _width = width;
+        _height = height;
+        Wake();
+    }
+
+    /// <summary>Frozen-resize end: exact-size buffer, final frame at offset 0,
+    /// GPU wait — the final window rect is applied right after this returns.</summary>
+    void OnFrozenResizeEnd(int width, int height)
+    {
+        // Same phase-alignment as begin (no warm-up needed — the GPU is hot
+        // from the gesture): final frame + final window rect inside one
+        // composition interval.
+        NativeMethods.DwmFlush();
+
+        _frozenResize = false;
+        _res.ClearTransparent = false;
+        _viewOffsetX = 0;
+        _viewOffsetY = 0;
+
+        _res.Resize(width, height); // no-op with sticky buffers (never shrinks)
+        _width = width;
+        _height = height;
+
+        Update();
+        RenderFrame();
+        _res.WaitForGpu();
+        Wake();
+    }
+
+    /// <summary>
+    /// The backdrop veil as a quad over exactly the apparent window rect.
+    /// Outside the gesture the veil is simply the clear color; during it, the
+    /// clear is fully transparent (the parked region must be invisible) and
+    /// this draw puts the veil back where the apparent window is.
+    /// </summary>
+    void DrawFrozenVeil()
+    {
+        float bufferW = _res.BufferWidth, bufferH = _res.BufferHeight;
+        _res.SetViewportAndScissor(0, 0, bufferW, bufferH);
+
+        float sx = _width / bufferW;
+        float sy = _height / bufferH;
+        float tx = (_viewOffsetX + _width * 0.5f) / bufferW * 2f - 1f;
+        float ty = 1f - (_viewOffsetY + _height * 0.5f) / bufferH * 2f;
+        var transform = Matrix4x4.CreateScale(sx, sy, 1f)
+                      * Matrix4x4.CreateTranslation(tx, ty, 0f);
+
+        _res.WriteConstants(CbSlotVeil, new Core.ViewConstants
+        {
+            Transform = Matrix4x4.Transpose(transform),
+            // Straight alpha — the shader premultiplies (TintColor.a is also
+            // the solid-color mode flag).
+            TintColor = new Vector4(0f, 0f, 0f, Core.DeviceResources.BackdropAlpha),
+        });
+        _res.DrawQuad(_res.WhiteSrvSlot, CbSlotVeil);
     }
 
     void NavigateToImage()

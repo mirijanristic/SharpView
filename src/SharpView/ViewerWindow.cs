@@ -33,6 +33,13 @@ namespace SharpView;
 /// treat it as snappable: Snap Layouts on drag-to-top, side snapping and
 /// Win+Arrows. On Windows 11 the style also brings native rounded corners and
 /// the DWM shadow; opt out with DWMWA_WINDOW_CORNER_PREFERENCE if ever unwanted.
+/// Mouse-driven edge/corner resizing does NOT use the system resize loop: it is
+/// a frozen-geometry gesture (see BeginFrozenResize) — the OS window is parked
+/// once at the gesture's maximal bounds and only the CONTENT moves per tick,
+/// which reduces DWM's two async channels (geometry, content) to one and makes
+/// resize flicker impossible by construction while the mouse is down. Keyboard
+/// sizing (Alt+Space → Size) still takes the system loop and the WM_NCCALCSIZE
+/// live-render path.
 /// Single-window design on purpose: the WndProc reaches the instance through a
 /// static field, no GWLP_USERDATA bookkeeping needed.
 /// </remarks>
@@ -54,6 +61,21 @@ sealed unsafe class ViewerWindow : IDisposable
     // True between WM_ENTERSIZEMOVE and WM_EXITSIZEMOVE — the window is inside
     // the system's modal move/size loop and the app loop is blocked.
     bool _inSizeMove;
+
+    // Minimum window size — enforced both by WM_GETMINMAXINFO (system paths)
+    // and by the frozen-resize clamps (our own gesture).
+    const int MinTrackWidth = 640;
+    const int MinTrackHeight = 400;
+
+    // ─── Frozen-geometry resize gesture ────────────────────────────────
+    // While active the OS window is parked at the gesture's maximal bounds and
+    // only the content moves (offset + apparent size per mouse tick).
+    bool _frozenResize;
+    int _frozenEdge;                        // HT code of the grabbed edge/corner
+    NativeMethods.RECT _frozenBounds;       // parked window rect
+    NativeMethods.RECT _frozenStartRect;    // apparent rect at gesture start
+    NativeMethods.POINT _frozenStartCursor;
+    NativeMethods.RECT _frozenApparent;     // current apparent rect (screen coords)
 
     public IntPtr Handle => _hwnd;
 
@@ -102,6 +124,23 @@ sealed unsafe class ViewerWindow : IDisposable
     /// here, BEFORE the follow-up <see cref="Resized"/> does the final exact-size
     /// pass.</summary>
     public Action? SizeMoveEnded;
+
+    /// <summary>Frozen resize began: (bufferW, bufferH, offsetX, offsetY,
+    /// apparentW, apparentH). The handler must resize the swap chain to the
+    /// buffer size, render one frame at the offset and not return until the
+    /// frame completes — the parked geometry is applied right after, so the
+    /// first composition already has matching pixels.</summary>
+    public Action<int, int, int, int, int, int>? FrozenResizeBegin;
+
+    /// <summary>Per mouse tick during frozen resize: (offsetX, offsetY,
+    /// apparentW, apparentH). Content-only change — rendering happens on the
+    /// app's normal loop at full pace; no geometry is touched.</summary>
+    public Action<int, int, int, int>? FrozenResizeTick;
+
+    /// <summary>Frozen resize ended: (finalW, finalH). The handler must resize
+    /// the swap chain to the exact final size, render at offset 0 and wait for
+    /// completion; the final window rect is applied immediately after.</summary>
+    public Action<int, int>? FrozenResizeEnd;
 
     /// <summary>Mouse capture was taken away mid-drag (Alt-Tab, ...) — end the pan.</summary>
     public Action? CaptureLost;
@@ -200,6 +239,18 @@ sealed unsafe class ViewerWindow : IDisposable
     public void GetCursorClientPosition(out int x, out int y, out bool insideClient)
     {
         NativeMethods.GetCursorPos(out var pt);
+
+        // Frozen resize: the OS client covers the parked rect, but every
+        // consumer thinks in apparent-window coordinates — translate.
+        if (_frozenResize)
+        {
+            x = pt.X - _frozenApparent.Left;
+            y = pt.Y - _frozenApparent.Top;
+            insideClient = x >= 0 && y >= 0
+                && x < _frozenApparent.Width && y < _frozenApparent.Height;
+            return;
+        }
+
         NativeMethods.ScreenToClient(_hwnd, ref pt);
         x = pt.X;
         y = pt.Y;
@@ -310,8 +361,8 @@ sealed unsafe class ViewerWindow : IDisposable
                 // system default (full monitor for a caption-less window) with
                 // WM_NCCALCSIZE clamping any frame overhang.
                 var mmi = (NativeMethods.MINMAXINFO*)lParam;
-                mmi->MinTrackSize.X = 640;
-                mmi->MinTrackSize.Y = 400;
+                mmi->MinTrackSize.X = MinTrackWidth;
+                mmi->MinTrackSize.Y = MinTrackHeight;
                 return 0;
             }
 
@@ -342,6 +393,15 @@ sealed unsafe class ViewerWindow : IDisposable
                 break;
 
             case NativeMethods.WM_NCLBUTTONDOWN:
+                // Edge/corner press → frozen-geometry gesture; the system
+                // resize loop (and its geometry-vs-content races) never starts.
+                if ((int)wParam >= NativeMethods.HTLeft
+                    && (int)wParam <= NativeMethods.HTBottomRight
+                    && !NativeMethods.IsZoomed(hwnd) && !_frozenResize)
+                {
+                    BeginFrozenResize((int)wParam);
+                    return 0;
+                }
                 // Maximized + caption: arm the WinForms-style drag-restore and
                 // swallow the message. Passing it to DefWindowProc would start a
                 // move loop that refuses to move a maximized window — the exact
@@ -361,6 +421,13 @@ sealed unsafe class ViewerWindow : IDisposable
                 _pendingDragRestore = false;
                 break; // dblclk → DefWindowProc toggles maximize/restore (unchanged)
 
+            case NativeMethods.WM_KEYDOWN when _frozenResize:
+                // ESC cancels back to the gesture's start rect, like the system
+                // loop; other keys are swallowed while resizing.
+                if ((int)wParam == NativeMethods.VK_ESCAPE)
+                    FinishFrozenResize(_frozenStartRect);
+                return 0;
+
             case NativeMethods.WM_KEYDOWN:
                 if (KeyHandler?.Invoke((int)wParam) == true) return 0;
                 break; // unhandled → DefWindowProc (lets Alt+F4 & friends work)
@@ -370,6 +437,10 @@ sealed unsafe class ViewerWindow : IDisposable
                 // the cursor outside the window (WinForms captured implicitly).
                 NativeMethods.SetCapture(hwnd);
                 MouseDown?.Invoke(LoWordX(lParam), HiWordY(lParam));
+                return 0;
+
+            case NativeMethods.WM_LBUTTONUP when _frozenResize:
+                FinishFrozenResize(_frozenApparent);
                 return 0;
 
             case NativeMethods.WM_LBUTTONUP:
@@ -382,11 +453,15 @@ sealed unsafe class ViewerWindow : IDisposable
                 return 0;
 
             case NativeMethods.WM_MOUSEMOVE:
+                if (_frozenResize) { FrozenResizeMouseMove(); return 0; }
                 // A fast caption drag can cross into the client area before the
                 // threshold trips — the pending restore must still fire.
                 if (_pendingDragRestore && TryStartDragRestore()) return 0;
                 MouseMove?.Invoke(LoWordX(lParam), HiWordY(lParam));
                 return 0;
+
+            case NativeMethods.WM_MOUSEWHEEL when _frozenResize:
+                return 0; // no zoom mid-gesture (coords would be parked-window-relative)
 
             case NativeMethods.WM_MOUSEWHEEL:
             {
@@ -397,6 +472,11 @@ sealed unsafe class ViewerWindow : IDisposable
                 MouseWheel?.Invoke(pt.X, pt.Y, delta);
                 return 0;
             }
+
+            case NativeMethods.WM_CAPTURECHANGED when _frozenResize:
+                // Capture stolen (Alt-Tab, ...) → commit at the current rect.
+                FinishFrozenResize(_frozenApparent, releaseCapture: false);
+                break;
 
             case NativeMethods.WM_CAPTURECHANGED:
                 CaptureLost?.Invoke();
@@ -459,6 +539,131 @@ sealed unsafe class ViewerWindow : IDisposable
         }
 
         return NativeMethods.DefWindowProc(hwnd, msg, wParam, lParam);
+    }
+
+    // ─── Frozen-geometry resize ────────────────────────────────────────
+
+    static bool MovesLeft(int edge) => edge is NativeMethods.HTLeft
+        or NativeMethods.HTTopLeft or NativeMethods.HTBottomLeft;
+    static bool MovesRight(int edge) => edge is NativeMethods.HTRight
+        or NativeMethods.HTTopRight or NativeMethods.HTBottomRight;
+    static bool MovesTop(int edge) => edge is NativeMethods.HTTop
+        or NativeMethods.HTTopLeft or NativeMethods.HTTopRight;
+    static bool MovesBottom(int edge) => edge is NativeMethods.HTBottom
+        or NativeMethods.HTBottomLeft or NativeMethods.HTBottomRight;
+
+    /// <summary>
+    /// Start the frozen-geometry gesture: the window is parked ONCE at the
+    /// maximal rect this gesture can reach (grabbed edges extended to the
+    /// virtual screen, fixed edges untouched) and does not change again until
+    /// the button is released — per tick only the content's offset and
+    /// apparent size move. One async channel instead of two: DWM cannot
+    /// compose a mismatched geometry/content pair, so the resize is
+    /// flicker-free by construction, and the left edge costs exactly as much
+    /// as the right one.
+    /// </summary>
+    void BeginFrozenResize(int edge)
+    {
+        _frozenEdge = edge;
+        NativeMethods.GetWindowRect(_hwnd, out _frozenStartRect);
+        NativeMethods.GetCursorPos(out _frozenStartCursor);
+        _frozenApparent = _frozenStartRect;
+
+        int vsLeft = NativeMethods.GetSystemMetrics(NativeMethods.SM_XVIRTUALSCREEN);
+        int vsTop = NativeMethods.GetSystemMetrics(NativeMethods.SM_YVIRTUALSCREEN);
+        int vsRight = vsLeft + NativeMethods.GetSystemMetrics(NativeMethods.SM_CXVIRTUALSCREEN);
+        int vsBottom = vsTop + NativeMethods.GetSystemMetrics(NativeMethods.SM_CYVIRTUALSCREEN);
+        _frozenBounds = new NativeMethods.RECT
+        {
+            Left = MovesLeft(edge) ? vsLeft : _frozenStartRect.Left,
+            Top = MovesTop(edge) ? vsTop : _frozenStartRect.Top,
+            Right = MovesRight(edge) ? vsRight : _frozenStartRect.Right,
+            Bottom = MovesBottom(edge) ? vsBottom : _frozenStartRect.Bottom,
+        };
+
+        // Deliberately NO DWM chrome toggling here: the parked edges sit
+        // exactly on the virtual-screen bounds, so their shadow/border fall
+        // offscreen by themselves, the fixed edges keep their chrome in the
+        // correct place, and parked-corner rounding only clips alpha-0 pixels.
+        // (An earlier version disabled NC rendering per gesture — the shadow
+        // popping off and on was itself a visible blink at grab/release.)
+
+        _frozenResize = true;
+        NativeMethods.SetCapture(_hwnd);
+        SetResizeCursor(edge);
+
+        // Content first, geometry second: the handler presents the offset frame
+        // into the parked-size buffer and waits for completion; the parked rect
+        // is applied immediately after, so the first composition that sees the
+        // new geometry already has the matching pixels.
+        FrozenResizeBegin?.Invoke(
+            _frozenBounds.Width, _frozenBounds.Height,
+            _frozenStartRect.Left - _frozenBounds.Left,
+            _frozenStartRect.Top - _frozenBounds.Top,
+            _frozenStartRect.Width, _frozenStartRect.Height);
+
+        NativeMethods.SetWindowPos(_hwnd, IntPtr.Zero,
+            _frozenBounds.Left, _frozenBounds.Top,
+            _frozenBounds.Width, _frozenBounds.Height,
+            NativeMethods.SWP_NOZORDER | NativeMethods.SWP_NOACTIVATE);
+    }
+
+    void FrozenResizeMouseMove()
+    {
+        NativeMethods.GetCursorPos(out var pt);
+        int dx = pt.X - _frozenStartCursor.X;
+        int dy = pt.Y - _frozenStartCursor.Y;
+
+        var rect = _frozenStartRect;
+        if (MovesLeft(_frozenEdge))
+            rect.Left = Math.Clamp(rect.Left + dx,
+                _frozenBounds.Left, rect.Right - MinTrackWidth);
+        if (MovesRight(_frozenEdge))
+            rect.Right = Math.Clamp(rect.Right + dx,
+                rect.Left + MinTrackWidth, _frozenBounds.Right);
+        if (MovesTop(_frozenEdge))
+            rect.Top = Math.Clamp(rect.Top + dy,
+                _frozenBounds.Top, rect.Bottom - MinTrackHeight);
+        if (MovesBottom(_frozenEdge))
+            rect.Bottom = Math.Clamp(rect.Bottom + dy,
+                rect.Top + MinTrackHeight, _frozenBounds.Bottom);
+        _frozenApparent = rect;
+
+        SetResizeCursor(_frozenEdge); // mouse capture bypasses WM_SETCURSOR
+        FrozenResizeTick?.Invoke(
+            rect.Left - _frozenBounds.Left, rect.Top - _frozenBounds.Top,
+            rect.Width, rect.Height);
+    }
+
+    void FinishFrozenResize(NativeMethods.RECT finalRect, bool releaseCapture = true)
+    {
+        _frozenResize = false;
+        if (releaseCapture) NativeMethods.ReleaseCapture();
+
+        // Same ordering as begin: final content presented and complete first,
+        // final geometry immediately after. The microseconds between the two
+        // are the only remaining race — once per gesture, with an idle mouse.
+        FrozenResizeEnd?.Invoke(finalRect.Width, finalRect.Height);
+
+        NativeMethods.SetWindowPos(_hwnd, IntPtr.Zero,
+            finalRect.Left, finalRect.Top, finalRect.Width, finalRect.Height,
+            NativeMethods.SWP_NOZORDER | NativeMethods.SWP_NOACTIVATE);
+
+        SetResizeCursor(0); // back to the arrow
+        Resized?.Invoke();  // safety net (same-size requests dedupe)
+    }
+
+    void SetResizeCursor(int edge)
+    {
+        int cursor = edge switch
+        {
+            NativeMethods.HTLeft or NativeMethods.HTRight => NativeMethods.IDC_SIZEWE,
+            NativeMethods.HTTop or NativeMethods.HTBottom => NativeMethods.IDC_SIZENS,
+            NativeMethods.HTTopLeft or NativeMethods.HTBottomRight => NativeMethods.IDC_SIZENWSE,
+            NativeMethods.HTTopRight or NativeMethods.HTBottomLeft => NativeMethods.IDC_SIZENESW,
+            _ => NativeMethods.IDC_ARROW,
+        };
+        NativeMethods.SetCursor(NativeMethods.LoadCursor(IntPtr.Zero, (IntPtr)cursor));
     }
 
     // ─── Resize borders ────────────────────────────────────────────────

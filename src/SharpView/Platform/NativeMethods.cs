@@ -89,6 +89,10 @@ internal static unsafe partial class NativeMethods
 
     public const int IDC_ARROW = 32512;
     public const int IDC_SIZEALL = 32646;
+    public const int IDC_SIZENWSE = 32642;
+    public const int IDC_SIZENESW = 32643;
+    public const int IDC_SIZEWE = 32644;
+    public const int IDC_SIZENS = 32645;
     public const int ICON_SMALL = 0;
     public const int ICON_BIG = 1;
 
@@ -106,6 +110,8 @@ internal static unsafe partial class NativeMethods
 
     /// <summary>Bounding box of ALL monitors — the true upper bound a resize
     /// gesture can reach (a window may span monitors mid-gesture).</summary>
+    public const int SM_XVIRTUALSCREEN = 76;
+    public const int SM_YVIRTUALSCREEN = 77;
     public const int SM_CXVIRTUALSCREEN = 78;
     public const int SM_CYVIRTUALSCREEN = 79;
 
@@ -389,6 +395,16 @@ internal static unsafe partial class NativeMethods
     /// this pins content and geometry into the same composition.</summary>
     [LibraryImport("dwmapi", EntryPoint = "DwmFlush")]
     public static partial int DwmFlush();
+
+    /// <summary>DWM attributes toggled around the frozen-resize gesture: the
+    /// window is parked at the gesture's maximal bounds, and Win11 must not
+    /// paint chrome (shadow/border/rounded corners) around that parked rect.</summary>
+    public const uint DWMWA_NCRENDERING_POLICY = 2;        // 0 = use style, 1 = disabled
+    public const uint DWMWA_WINDOW_CORNER_PREFERENCE = 33; // 0 = default, 1 = do not round
+
+    [LibraryImport("dwmapi", EntryPoint = "DwmSetWindowAttribute")]
+    public static partial int DwmSetWindowAttribute(IntPtr hwnd, uint attribute,
+        ref int value, uint size);
 
     // ─── kernel32 / shell32 ────────────────────────────────────────────
 

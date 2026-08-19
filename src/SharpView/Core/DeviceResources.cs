@@ -75,14 +75,12 @@ sealed unsafe class DeviceResources : IDisposable
     // (notably the post-Show verification of the pre-sized startup swap chain).
     int _bufferWidth, _bufferHeight;
 
-    // Live-resize mode: buffers stay allocated at gesture-max while the window
-    // shrinks/grows underneath. No SetSourceSize here — on a COMPOSITION swap
-    // chain the visual shows content at buffer size and a smaller source region
-    // gets STRETCHED to it (magnified, deformed image). Instead the scene is
-    // rendered window-sized into the buffer's top-left and the window itself is
-    // the clip: DWM cuts the visual to the window rect, so exactly the top-left
-    // w×h shows, 1:1, with zero scaling anywhere.
-    bool _liveResize;
+    // Buffers are STICKY-MAX: they only ever grow (see Resize). The scene is
+    // rendered window-sized into the buffer's top-left (or at an offset during
+    // the frozen-resize gesture) and the window itself is the clip: DWM cuts
+    // the visual to the window rect, so exactly the right region shows, 1:1,
+    // with zero scaling anywhere. No SetSourceSize — on a COMPOSITION swap
+    // chain a smaller source region gets STRETCHED to buffer size.
 
     // Constant buffer (one region of MaxCbSlots per frame in flight)
     ID3D12Resource _constantBuffer = null!;
@@ -115,6 +113,13 @@ sealed unsafe class DeviceResources : IDisposable
     /// live-resize gesture (the underlay pass needs to cover all of it).</summary>
     public int BufferWidth => _bufferWidth;
     public int BufferHeight => _bufferHeight;
+
+    /// <summary>When true, BeginFrame clears to fully transparent (alpha 0)
+    /// instead of the backdrop veil. Used by the frozen-geometry resize: the OS
+    /// window is temporarily parked larger than the apparent one, everything
+    /// outside the apparent rect must be invisible, and the veil is drawn as a
+    /// quad over the apparent rect only.</summary>
+    public bool ClearTransparent { get; set; }
 
     public bool IsWarp { get; private set; }
 
@@ -506,7 +511,9 @@ sealed unsafe class DeviceResources : IDisposable
         _cmdList.OMSetRenderTargets(rtv);
         // Premultiplied translucent black (black is (0,0,0) at any alpha): every
         // pixel not covered by opaque draws lets the desktop show through.
-        _cmdList.ClearRenderTargetView(rtv, new Color4(0f, 0f, 0f, BackdropAlpha));
+        // (Alpha 0 during frozen resize — see ClearTransparent.)
+        _cmdList.ClearRenderTargetView(rtv,
+            new Color4(0f, 0f, 0f, ClearTransparent ? 0f : BackdropAlpha));
 
         _cmdList.SetGraphicsRootSignature(RootSignature);
         _cmdList.SetDescriptorHeaps(1, new[] { _srvHeap });
@@ -560,57 +567,27 @@ sealed unsafe class DeviceResources : IDisposable
     {
         if (width <= 0 || height <= 0) return;
 
-        // Live resize (interactive edge/corner sizing): the buffers were sized
-        // for the whole gesture up front, so a per-tick "resize" is a no-op at
-        // the swap chain level — the caller just renders the new window-sized
-        // layout into the buffer's top-left (its viewport already does that)
-        // and the window clips the rest. Microseconds instead of a full GPU
-        // wait plus buffer reallocation; cheap ticks are half of what keeps
-        // the left/top edges wobble-free.
-        if (_liveResize)
-        {
-            EnsureBufferCapacity(width, height); // rare: dragged onto a larger monitor
-            return;
-        }
-
-        // Same size? Nothing to rebuild — and skipping the full GPU wait is what
-        // keeps the pre-sized startup swap chain path completely stall-free.
-        // (Also dedupes spurious same-size Resize events at runtime.)
-        if (width == _bufferWidth && height == _bufferHeight) return;
-
-        WaitForGpu();
-
-        for (int i = 0; i < FrameCount; i++)
-        { _renderTargets[i]?.Dispose(); _renderTargets[i] = null!; }
-
-        SwapChain.ResizeBuffers(FrameCount, (uint)width, (uint)height,
-            BackBufferFormat, SwapChainFlags.None);
-        _frameIndex = (int)SwapChain.CurrentBackBufferIndex;
-        CreateRenderTargets();
-
-        _bufferWidth = width;
-        _bufferHeight = height;
+        // STICKY-MAX policy: never shrink, only grow. A buffer larger than the
+        // window is always valid (the window clips the presentation), and never
+        // reallocating on shrink means gesture begin/end, maximize/restore and
+        // every other size change cannot hit the ResizeBuffers gap — the one
+        // composition between "old buffers discarded" and "new frame presented"
+        // in which DWM shows an EMPTY visual: the whole-window flash. Cost: the
+        // buffers retain the largest size seen this session (worst case the
+        // virtual screen — tens of MB of VRAM), which for a GPU image viewer is
+        // a fair trade for flashless geometry transitions.
+        EnsureBufferCapacity(width, height);
     }
 
-    /// <summary>
-    /// Enter live-resize mode: the buffers grow once to cover the whole gesture
-    /// (typically the monitor size) and stay put; every following
-    /// <see cref="Resize"/> becomes free — the window itself clips the
-    /// oversized content. Idempotent — safe to call on every resize tick.
-    /// </summary>
+    /// <summary>Reserve capacity for a whole resize gesture up front (the
+    /// buffers are sticky, so this costs a reallocation at most once per
+    /// reached size). Idempotent — safe to call on every tick.</summary>
     public void BeginLiveResize(int maxWidth, int maxHeight)
-    {
-        _liveResize = true;
-        EnsureBufferCapacity(maxWidth, maxHeight);
-    }
+        => EnsureBufferCapacity(maxWidth, maxHeight);
 
-    /// <summary>
-    /// Leave live-resize mode. The regular <see cref="Resize"/> the app fires
-    /// right after the gesture reallocates the buffers to the exact final size,
-    /// releasing the gesture-sized surplus (or is a free no-op when the gesture
-    /// ended exactly at buffer size, e.g. a snap-maximize).
-    /// </summary>
-    public void EndLiveResize() => _liveResize = false;
+    /// <summary>Kept for call-site symmetry; with sticky buffers there is
+    /// nothing to undo at gesture end (no shrink — no ResizeBuffers flash).</summary>
+    public void EndLiveResize() { }
 
     /// <summary>Grow (never shrink) the buffers. Growth is rounded up to 256 px
     /// chunks: it should never trigger mid-gesture (capacity covers the virtual
