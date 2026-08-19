@@ -168,30 +168,37 @@ Extensions", odnosno "HEIF Image Extensions"; za HEVC-kodiran HEIC dodatno i
 HEVC kodek). Detekcija je runtime: ekstenzije se pojavljuju u navigaciji i
 dijalogu samo kad stvarno rade, pa nema tihih promašaja.
 
-### RAW (NEF)
+### RAW (NEF, NRW, DNG, RAF)
 
-Nikon NEF se dekodira kroz bundlovan **LibRaw** (`raw_r.dll`, thread-safe
-build iz `Sdcb.LibRaw.runtime.win64` paketa). Politika je *preview-first*:
-iz RAW-a se izvuče JPEG preview koji kamera ugrađuje (obično puna rezolucija)
-i dekodira kroz postojeći WIC put — čita se samo JPEG blok, senzorski podaci
-se ne diraju, pa je otvaranje reda milisekundi umjesto sekundi. Pravi demozaik
-(LibRaw dcraw pipeline, kamera WB preko `cam_mul`) radi samo kao fallback kad
-upotrebljiv preview ne postoji, što je kod NEF-a praktično nikad.
+RAW formati se dekodiraju kroz bundlovan **LibRaw** (`raw_r.dll`, thread-safe
+build iz `Sdcb.LibRaw.runtime.win64` paketa): Nikon NEF/NRW, Adobe/kamera DNG
+i Fuji RAF. Politika je *preview-first*: iz RAW-a se izvuče JPEG preview koji
+kamera ugrađuje (obično puna rezolucija) i dekodira kroz postojeći WIC put —
+čita se samo JPEG blok, senzorski podaci se ne diraju, pa je otvaranje reda
+milisekundi umjesto sekundi. Pravi demozaik (LibRaw dcraw pipeline, kamera WB
+preko `cam_mul`) radi samo kao fallback kad upotrebljiv preview ne postoji.
+U praksi: kamera fajlovi (NEF/NRW/RAF, in-camera DNG) praktično uvijek lete
+preview putem; Adobe-konvertovani DNG zna imati samo srednji preview
+(~1024 px) koji veličinski gate ispravno odbije — tada ide demozaik, sporiji
+ali pošten (kod RAF-a bi bio i osjetno sporiji zbog X-Trans senzora, pa je
+preview put tamo još bitniji).
 
-EXIF orijentacija radi za RAW od prvog dana: NEF je TIFF kontejner, pa se
-Orientation tag čita iz IFD0 (vlastiti mini čitač, nezavisan od verzije
-LibRaw-a) i primijeni na piksele; demozaik put rotaciju dobija besplatno jer
-je LibRaw sam primjenjuje. Napomena o bojama: preview je kamerin JPEG
-rendering (picture control, izoštravanje), pa se od "sirovog" demozaika može
-minimalno razlikovati — za preglednik je to poželjno, slika izgleda kao na
-poleđini aparata.
+EXIF orijentacija radi za sve RAW formate: NEF/NRW/DNG su TIFF kontejneri,
+pa se Orientation tag čita iz IFD0 (vlastiti mini čitač, nezavisan od verzije
+LibRaw-a); RAF nije TIFF, pa se tag čita iz EXIF bloka ugrađenog JPEG-a koji
+je ionako već u memoriji (`JpegOrientation` nađe APP1/Exif segment i preda ga
+istom TIFF čitaču). Demozaik put rotaciju dobija besplatno jer je LibRaw sam
+primjenjuje. Napomena o bojama: preview je kamerin JPEG rendering (picture
+control, izoštravanje), pa se od "sirovog" demozaika može minimalno
+razlikovati — za preglednik je to poželjno, slika izgleda kao na poleđini
+aparata.
 
 LibRaw sloj je format-agnostičan (LibRaw fajl prepoznaje po sadržaju, ne po
-ekstenziji), pa je plan širenja: NRW (isti Nikon pipeline), zatim DNG (TIFF —
-orijentacija već pokrivena), pa RAF (Fuji: nije TIFF, orijentacija ide iz
-EXIF-a ugrađenog JPEG-a; X-Trans demozaik fallback je osjetno skuplji).
+ekstenziji), pa se dalji formati dodaju jednom ekstenzijom u
+`RawDecoder.ExtensionList` + registracijama + testom sa stvarnim fajlovima.
 Licenca: native binarke su LGPL-2.1-only OR CDDL-1.0 (dinamičko linkovanje,
-kompatibilno sa MIT licencom projekta).
+kompatibilno sa MIT licencom projekta; zahtijevaju VC++ runtime — instaler ga
+rješava preuzimanjem, portable ZIP ga nosi app-local).
 
 ## TODO
 
@@ -200,13 +207,15 @@ kompatibilno sa MIT licencom projekta).
   fit prikazu velikih fotografija i vraća smisao anizotropnom filtriranju.
   Najveći preostali golim okom vidljiv dobitak.
 - [ ] **Formati** — Dodaj nove formate, ukljucujuci .ico i formate za iphone,
-  i .raw formate — **djelimično: NEF gotov (LibRaw)**; slijede NRW, DNG, RAF
-  (dodavanje ekstenzije + test po formatu, vidi `RawDecoder`).
+  i .raw formate — **RAW gotov: NEF, NRW, DNG, RAF (LibRaw)**; ostaje .ico
+  (u navigaciji; otvaranje već radi kroz WIC) i eventualni dalji RAW formati
+  (jedna ekstenzija u `RawDecoder` + registracije + test).
 - [ ] Windows 10 ne radi associate files u exe setup
 - [ ] **EXIF orijentacija** — auto-rotacija fotografija sa telefona; bez nje
-  se portretni snimci prikazuju položeni na bok. **Djelimično: za RAW (NEF)
-  urađeno** (`TiffOrientation` + `PixelOrientation`); ostaje primjena istog
-  mehanizma na JPEG/TIFF put.
+  se portretni snimci prikazuju položeni na bok. **Djelimično: za sve RAW
+  formate urađeno** (`TiffOrientation` + `JpegOrientation` +
+  `PixelOrientation`); ostaje primjena istog mehanizma na JPEG/TIFF put —
+  čitači već postoje, treba ih samo pozvati iz WIC/GDI+ grane dekodera.
 - [ ] Sortiranje po datumu (i veličini) pored abecednog.
 - [ ] Borderless fullscreen (F11) bez naslovne trake.
 

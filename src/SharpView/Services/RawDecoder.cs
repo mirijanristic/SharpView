@@ -7,25 +7,27 @@ namespace SharpView.Services;
 /// full-resolution JPEG the camera embeds in the RAW is extracted (milliseconds —
 /// only the JPEG blob is read from disk, the sensor data is never touched) and
 /// decoded through the existing WIC pipeline. A real demosaic runs only as a
-/// fallback when no adequately sized preview exists — rare in practice, since
-/// every Nikon body embeds a full-size preview.
+/// fallback when no adequately sized preview exists.
 /// </summary>
 /// <remarks>
 /// <para>
 /// The LibRaw layer itself is format-agnostic (LibRaw identifies files by
-/// content, not extension), so enabling the next formats is mostly: add the
-/// extension to <see cref="ExtensionList"/> + test. NEF is production format #1.
-/// Planned next: <c>.nrw</c> (same Nikon pipeline, effectively free), <c>.dng</c>
-/// (TIFF container — orientation reader already covers it; preview sizes vary by
-/// producer, so test converted files too), <c>.raf</c> (Fuji: NOT a TIFF, so
-/// orientation must come from the embedded JPEG's EXIF, and the X-Trans demosaic
-/// fallback is markedly slower than Bayer).
+/// content, not extension), so <see cref="ExtensionList"/> is the only gate.
+/// Format notes: NEF/NRW (Nikon) and in-camera DNGs embed full-size previews, so
+/// the fast path is the norm. Adobe-converted DNGs often carry only a medium
+/// (~1024 px) preview — the size gate correctly rejects it and the demosaic
+/// fallback runs: slower but honest. RAF (Fuji) embeds full-size previews too;
+/// its demosaic fallback is markedly slower than Bayer (X-Trans), which makes
+/// the preview path matter even more there.
 /// </para>
 /// <para>
 /// Orientation: embedded previews are stored in sensor orientation, so the
-/// preview path reads the TIFF IFD0 Orientation tag (<see cref="TiffOrientation"/>)
-/// and rotates the pixels (<see cref="PixelOrientation"/>). The demosaic path
-/// needs neither — LibRaw applies the camera flip itself.
+/// preview path must rotate pixels (<see cref="PixelOrientation"/>). The tag is
+/// resolved by <see cref="ReadOrientation"/>: TIFF containers (NEF/NRW/DNG)
+/// answer via IFD0 (<see cref="TiffOrientation"/>); RAF is not a TIFF, so its
+/// orientation comes from the embedded JPEG's own EXIF block
+/// (<see cref="JpegOrientation"/>). The demosaic path needs neither — LibRaw
+/// applies the camera flip itself.
 /// </para>
 /// <para>
 /// Every decode creates its own LibRaw handle, and the shipped dll is the
@@ -35,8 +37,10 @@ namespace SharpView.Services;
 /// </remarks>
 static unsafe class RawDecoder
 {
-    // Production format #1; see the class remarks for the rollout plan.
-    static readonly string[] ExtensionList = { ".nef" };
+    // Every extension here must be covered by ReadOrientation (TIFF container or
+    // EXIF-bearing embedded JPEG) and tested with real camera files before
+    // shipping — LibRaw itself would accept many more.
+    static readonly string[] ExtensionList = { ".nef", ".nrw", ".dng", ".raf" };
 
     /// <summary>Extensions routed to this decoder (lower-case, with leading dot).</summary>
     public static IReadOnlyList<string> Extensions => ExtensionList;
@@ -92,7 +96,7 @@ static unsafe class RawDecoder
                     maxDimension, lowQuality, out int pw, out int ph);
                 if (preview is not null)
                 {
-                    int orientation = TiffOrientation.Read(path);
+                    int orientation = ReadOrientation(path, thumb);
                     preview = PixelOrientation.Apply(preview, ref pw, ref ph, orientation);
                     width = pw;
                     height = ph;
@@ -135,7 +139,7 @@ static unsafe class RawDecoder
                     byte[] square = WicDecoder.DecodeSquareBgra(thumb.Data, size);
                     int sw = size, sh = size;
                     return PixelOrientation.Apply(square, ref sw, ref sh,
-                        TiffOrientation.Read(path));
+                        ReadOrientation(path, thumb));
                 }
 
                 if (IsUsableRgbBitmap(thumb))
@@ -145,7 +149,7 @@ static unsafe class RawDecoder
                         bgra, thumb.Width, thumb.Height, size);
                     int sw = size, sh = size;
                     return PixelOrientation.Apply(square, ref sw, ref sh,
-                        TiffOrientation.Read(path));
+                        ReadOrientation(path, thumb));
                 }
             }
 
@@ -158,6 +162,25 @@ static unsafe class RawDecoder
         {
             LibRawNative.Close(handle);
         }
+    }
+
+    // ─── Orientation ───────────────────────────────────────────────────
+
+    /// <summary>
+    /// Orientation for the preview path, resolved format-agnostically. TIFF
+    /// containers (NEF/NRW/DNG) answer via IFD0. When that yields "normal" —
+    /// which is also exactly what a non-TIFF container (RAF) returns — the
+    /// embedded JPEG's own EXIF is consulted: the only source of truth for RAF,
+    /// and harmless for TIFF files (their previews rarely carry EXIF, and when
+    /// they do it agrees with IFD0). Scanning a few KB of JPEG headers is noise
+    /// next to the decode itself.
+    /// </summary>
+    static int ReadOrientation(string path, in RawThumb thumb)
+    {
+        int orientation = TiffOrientation.Read(path);
+        if (orientation == 1 && thumb.Type == LibRawNative.ImageJpeg)
+            orientation = JpegOrientation.Read(thumb.Data);
+        return orientation;
     }
 
     // ─── Embedded preview ──────────────────────────────────────────────

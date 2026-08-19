@@ -132,6 +132,9 @@ Root: HKA; Subkey: "Software\Classes\Applications\{#MyAppExeName}\SupportedTypes
 Root: HKA; Subkey: "Software\Classes\Applications\{#MyAppExeName}\SupportedTypes"; ValueType: string; ValueName: ".ico";  ValueData: ""
 Root: HKA; Subkey: "Software\Classes\Applications\{#MyAppExeName}\SupportedTypes"; ValueType: string; ValueName: ".heic"; ValueData: ""
 Root: HKA; Subkey: "Software\Classes\Applications\{#MyAppExeName}\SupportedTypes"; ValueType: string; ValueName: ".nef";  ValueData: ""
+Root: HKA; Subkey: "Software\Classes\Applications\{#MyAppExeName}\SupportedTypes"; ValueType: string; ValueName: ".nrw";  ValueData: ""
+Root: HKA; Subkey: "Software\Classes\Applications\{#MyAppExeName}\SupportedTypes"; ValueType: string; ValueName: ".dng";  ValueData: ""
+Root: HKA; Subkey: "Software\Classes\Applications\{#MyAppExeName}\SupportedTypes"; ValueType: string; ValueName: ".raf";  ValueData: ""
 
 ; ---------------------------------------------------------------------------
 ; Capabilities - ovim SharpView ulazi u Settings > Default apps, gdje ga
@@ -153,6 +156,9 @@ Root: HKA; Subkey: "Software\{#MyAppName}\Capabilities\FileAssociations"; ValueT
 Root: HKA; Subkey: "Software\{#MyAppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".ico";  ValueData: "{#MyProgId}"; Tasks: associate
 Root: HKA; Subkey: "Software\{#MyAppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".heic"; ValueData: "{#MyProgId}"; Tasks: associate
 Root: HKA; Subkey: "Software\{#MyAppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".nef";  ValueData: "{#MyProgId}"; Tasks: associate
+Root: HKA; Subkey: "Software\{#MyAppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".nrw";  ValueData: "{#MyProgId}"; Tasks: associate
+Root: HKA; Subkey: "Software\{#MyAppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".dng";  ValueData: "{#MyProgId}"; Tasks: associate
+Root: HKA; Subkey: "Software\{#MyAppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".raf";  ValueData: "{#MyProgId}"; Tasks: associate
 
 Root: HKA; Subkey: "Software\RegisteredApplications"; ValueType: string; ValueName: "{#MyAppName}"; ValueData: "Software\{#MyAppName}\Capabilities"; Tasks: associate; Flags: uninsdeletevalue
 
@@ -287,5 +293,8 @@ begin
     CleanExplorerCacheForExt('.ico');
     CleanExplorerCacheForExt('.heic');
     CleanExplorerCacheForExt('.nef');
+    CleanExplorerCacheForExt('.nrw');
+    CleanExplorerCacheForExt('.dng');
+    CleanExplorerCacheForExt('.raf');
   end;
 end;

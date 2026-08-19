@@ -27,8 +27,9 @@ internal static class FileAssociations
         ".bmp", ".gif", ".jpeg", ".jpg", ".png", ".tif", ".tiff",
         // RAW: unlike WebP/HEIC there is no external-codec dependency to detect —
         // the LibRaw dll ships next to the exe (NuGet runtime package), so the
-        // association is registered unconditionally.
-        ".nef"
+        // associations are registered unconditionally. Keep in sync with
+        // RawDecoder.ExtensionList and the installer's extension lists.
+        ".nef", ".nrw", ".dng", ".raf"
     };
 
     public static void Register()
