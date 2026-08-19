@@ -47,53 +47,61 @@ jobs:
       - name: Restore
         run: dotnet restore ${{ env.PROJECT }} -r win-x64
 
+      # Testovi se vrte na CoreCLR-u (PublishAot ne utice na dotnet test);
+      # AOT/trim analizatori su ukljuceni i ovdje, pa nekompatibilan kod
+      # obara build prije nego sto dodje do publish-a.
       - name: Test
         run: dotnet test -c Release
 
       # ----------------------------------------------------------------------
-      # Meta 1: framework-dependent -> ide u instaler.
-      # ~3 MB. Instaler sam preuzme .NET Desktop Runtime ako ga korisnik nema.
+      # Jedan jedini publish: Native AOT (PublishAot je u csproj-u).
+      # Izlaz je nativni exe + LibRaw dll-ovi - nema .NET runtime zavisnosti,
+      # pa isti folder hrani i instaler i portable ZIP. MSVC linker koji AOT
+      # trazi je preinstaliran na windows-latest runneru (VS 2022 + C++).
+      # NAPOMENA: --self-contained / PublishReadyToRun / PublishSingleFile se
+      # NE smiju prosljedjivati - sudaraju se sa PublishAot.
       # ----------------------------------------------------------------------
-      - name: Publish (framework-dependent)
+      - name: Publish (Native AOT)
         run: >
           dotnet publish ${{ env.PROJECT }}
           -c Release
           -r win-x64
-          --self-contained false
-          -p:PublishReadyToRun=true
-          -p:PublishSingleFile=false
-          -p:DebugType=none
-          -p:SatelliteResourceLanguages=en
           -p:Version=${{ steps.ver.outputs.version }}
           -o publish
 
       # ----------------------------------------------------------------------
-      # Meta 2: self-contained -> ide u portable ZIP.
-      # Veci je, ali radi na masini bez ijedne instalirane zavisnosti.
+      # Portable ZIP: publish izlaz (bez PDB simbola) + app-local VC++ CRT.
+      # raw_r.dll (LibRaw, vcpkg build) vuce vcruntime140/msvcp140/vcomp140;
+      # instaler to rjesava preuzimanjem VC redist-a, ali portable korisnik
+      # nema instaler - zato ZIP nosi te dll-ove pored exe-a (app-local
+      # deployment, dozvoljen nacin redistribucije VC runtimea). Kopiraju se
+      # sa runnerovog VS-a. Bez njih bi na cistoj masini sve radilo OSIM
+      # NEF/RAW podrske, koja bi tiho nestala.
       # ----------------------------------------------------------------------
-      - name: Publish (self-contained)
-        run: >
-          dotnet publish ${{ env.PROJECT }}
-          -c Release
-          -r win-x64
-          --self-contained true
-          -p:PublishReadyToRun=true
-          -p:PublishSingleFile=false
-          -p:DebugType=none
-          -p:SatelliteResourceLanguages=en
-          -p:Version=${{ steps.ver.outputs.version }}
-          -o publish-sc
-
       - name: Portable ZIP
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force -Path dist | Out-Null
-          Compress-Archive -Path publish-sc\* `
+          New-Item -ItemType Directory -Force -Path portable, dist | Out-Null
+          Copy-Item publish\* portable\ -Recurse -Exclude *.pdb
+
+          $redist = "${env:ProgramFiles}\Microsoft Visual Studio\2022\*\VC\Redist\MSVC\*\x64"
+          $crt = Get-ChildItem "$redist\Microsoft.VC14*.CRT"    -Directory | Sort-Object FullName | Select-Object -Last 1
+          $omp = Get-ChildItem "$redist\Microsoft.VC14*.OpenMP" -Directory | Sort-Object FullName | Select-Object -Last 1
+          if (-not $crt -or -not $omp) { throw "VC++ redist folderi nisu nadjeni na runneru - provjeri putanju: $redist" }
+          Copy-Item "$($crt.FullName)\vcruntime140.dll",
+                    "$($crt.FullName)\vcruntime140_1.dll",
+                    "$($crt.FullName)\msvcp140.dll" portable\
+          Copy-Item "$($omp.FullName)\vcomp140.dll" portable\
+          Get-ChildItem portable | Format-Table Name, Length
+
+          Compress-Archive -Path portable\* `
             -DestinationPath "dist\SharpView-${{ steps.ver.outputs.version }}-win-x64-portable.zip"
 
       - name: Instaliraj Inno Setup
         run: choco install innosetup -y --no-progress
 
+      # Instaler pakuje .\publish (PDB iskljucuje sam .iss); VC runtime NE
+      # nosi u sebi - detektuje ga i po potrebi preuzme pri instalaciji.
       - name: Napravi instaler
         shell: pwsh
         run: |

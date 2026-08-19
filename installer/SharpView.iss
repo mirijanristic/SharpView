@@ -4,11 +4,15 @@
 ;  Build:
 ;    "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" /DMyAppVersion=1.0.0 installer\SharpView.iss
 ;
-;  Ocekuje framework-dependent build u .\publish :
-;    dotnet publish src/SharpView/SharpView.csproj -c Release -r win-x64 `
-;      --self-contained false -p:PublishReadyToRun=true -o publish
+;  Ocekuje Native AOT publish u .\publish :
+;    dotnet publish src/SharpView/SharpView.csproj -c Release -r win-x64 -o publish
+;  (PublishAot je u csproj-u; masina koja radi publish mora imati MSVC linker -
+;   "Desktop development with C++" workload. Krajnjem korisniku .NET runtime
+;   NIJE potreban: exe je nativan i samodostatan.)
 ;
-;  Ako .NET 10 Desktop Runtime nije prisutan, instaler ga preuzme i instalira.
+;  Jedina runtime zavisnost koju instaler rjesava je Microsoft Visual C++
+;  Runtime (vcruntime140/msvcp140) - treba je raw_r.dll (LibRaw, vcpkg build sa
+;  dinamickim CRT-om) za NEF/RAW podrsku. Ako nedostaje, preuzme se i instalira.
 ;  Zahtijeva Inno Setup 6.3 ili noviji (CreateDownloadPage + x64compatible).
 ; ============================================================================
 
@@ -23,9 +27,11 @@
 #define MyProgId         "SharpView.Image"
 #define PublishDir       "..\publish"
 
-; Verzija runtimea koju aplikacija zahtijeva
-#define DotNetMajor      "10"
-#define DotNetUrl        "https://aka.ms/dotnet/10.0/windowsdesktop-runtime-win-x64.exe"
+; VC++ 2015-2022 Redistributable (x64) - zvanicni Microsoft permalink.
+; Treba ga iskljucivo raw_r.dll (LibRaw); bez njega aplikacija radi, ali NEF
+; podrska tiho nestaje (RawDecoder.IsAvailable = false). Ako se LibRaw ikad
+; rebuilduje sa statickim CRT-om, cijeli VC redist mehanizam se moze obrisati.
+#define VCRedistUrl      "https://aka.ms/vs/17/release/vc_redist.x64.exe"
 
 ; VersionInfoVersion mora biti cisto numericki (x.y.z) - ako verzija ima
 ; sufiks poput 1.2.0-beta, za version info se koristi samo numericki dio.
@@ -60,8 +66,9 @@ OutputDir=..\dist
 OutputBaseFilename=SharpView-{#MyAppVersion}-win-x64-setup
 SetupIconFile=..\src\SharpView\app.ico
 
-; Instalacija runtimea trazi admina, pa nema smisla nuditi per-user rezim -
-; korisnik bi inace dobio dva UAC prompta umjesto jednog.
+; Zadrzano admin: eventualna instalacija VC++ runtimea trazi admina, a i
+; rezim instalacije ne treba mijenjati poslije prvog objavljenog release-a
+; (promjena rezima napravi dvostruku instalaciju umjesto update-a).
 PrivilegesRequired=admin
 
 ArchitecturesAllowed=x64compatible
@@ -84,16 +91,18 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 Name: "associate";   Description: "Register SharpView as an option for image files"; GroupDescription: "File associations:"
 
 [Files]
-Source: "{#PublishDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+; PDB simboli ne idu korisnicima - samo nepotrebno sire instalaciju.
+Source: "{#PublishDir}\*"; DestDir: "{app}"; Excludes: "*.pdb"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
 Name: "{autoprograms}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
 Name: "{autodesktop}\{#MyAppName}";  Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
 
 [Run]
-; Runtime prvi, aplikacija poslije. [Run] stavke se izvrsavaju redom.
-; Svaka stavka MORA biti u jednom redu - Inno Setup nema nastavak reda u sekcijama.
-Filename: "{tmp}\dotnet-desktop-runtime.exe"; Parameters: "/install /quiet /norestart"; StatusMsg: "Installing .NET {#DotNetMajor} Desktop Runtime..."; Check: RuntimeInstallerDownloaded; Flags: waituntilterminated
+; VC++ runtime prvi (ako je preuzet), aplikacija poslije. [Run] stavke se
+; izvrsavaju redom. Svaka stavka MORA biti u jednom redu - Inno Setup nema
+; nastavak reda u sekcijama.
+Filename: "{tmp}\vc_redist.x64.exe"; Parameters: "/install /quiet /norestart"; StatusMsg: "Installing Microsoft Visual C++ Runtime..."; Check: VCRedistInstallerDownloaded; Flags: waituntilterminated
 Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')}}"; Flags: nowait postinstall skipifsilent
 
 [Registry]
@@ -122,6 +131,7 @@ Root: HKA; Subkey: "Software\Classes\Applications\{#MyAppExeName}\SupportedTypes
 Root: HKA; Subkey: "Software\Classes\Applications\{#MyAppExeName}\SupportedTypes"; ValueType: string; ValueName: ".webp"; ValueData: ""
 Root: HKA; Subkey: "Software\Classes\Applications\{#MyAppExeName}\SupportedTypes"; ValueType: string; ValueName: ".ico";  ValueData: ""
 Root: HKA; Subkey: "Software\Classes\Applications\{#MyAppExeName}\SupportedTypes"; ValueType: string; ValueName: ".heic"; ValueData: ""
+Root: HKA; Subkey: "Software\Classes\Applications\{#MyAppExeName}\SupportedTypes"; ValueType: string; ValueName: ".nef";  ValueData: ""
 
 ; ---------------------------------------------------------------------------
 ; Capabilities - ovim SharpView ulazi u Settings > Default apps, gdje ga
@@ -142,6 +152,7 @@ Root: HKA; Subkey: "Software\{#MyAppName}\Capabilities\FileAssociations"; ValueT
 Root: HKA; Subkey: "Software\{#MyAppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".webp"; ValueData: "{#MyProgId}"; Tasks: associate
 Root: HKA; Subkey: "Software\{#MyAppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".ico";  ValueData: "{#MyProgId}"; Tasks: associate
 Root: HKA; Subkey: "Software\{#MyAppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".heic"; ValueData: "{#MyProgId}"; Tasks: associate
+Root: HKA; Subkey: "Software\{#MyAppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".nef";  ValueData: "{#MyProgId}"; Tasks: associate
 
 Root: HKA; Subkey: "Software\RegisteredApplications"; ValueType: string; ValueName: "{#MyAppName}"; ValueData: "Software\{#MyAppName}\Capabilities"; Tasks: associate; Flags: uninsdeletevalue
 
@@ -152,66 +163,47 @@ Type: filesandordirs; Name: "{app}"
 [Code]
 var
   DownloadPage: TDownloadWizardPage;
-  RuntimeChecked: Boolean;
-  RuntimeMissing: Boolean;
+  VCRedistChecked: Boolean;
+  VCRedistMissing: Boolean;
 
-{ Trazi bilo koju instaliranu verziju Microsoft.WindowsDesktop.App cija se
-  glavna verzija poklapa sa trazenom. Rezultat se kesira jer se funkcija
-  poziva i iz [Run] Check parametra. }
-function DetectDotNetRuntime: Boolean;
+{ VC++ 2015-2022 runtime (x64): zvanicni registry kljuc, plus fallback provjera
+  samih dll-ova u System32 - ako su tamo, ucitavanje radi bez obzira na
+  registry. Rezultat se kesira jer se funkcija poziva i iz [Run] Check-a. }
+function DetectVCRedist: Boolean;
 var
-  FindRec: TFindRec;
-  BasePath: String;
-  Prefix: String;
+  Installed: Cardinal;
 begin
-  Result := False;
-  BasePath := ExpandConstant('{commonpf64}\dotnet\shared\Microsoft.WindowsDesktop.App');
-  Prefix := '{#DotNetMajor}' + '.';
-
-  if not DirExists(BasePath) then
-    Exit;
-
-  if FindFirst(BasePath + '\*', FindRec) then
-  begin
-    try
-      repeat
-        if (FindRec.Attributes and FILE_ATTRIBUTE_DIRECTORY) <> 0 then
-          if (FindRec.Name <> '.') and (FindRec.Name <> '..') then
-            if Pos(Prefix, FindRec.Name) = 1 then
-            begin
-              Result := True;
-              Break;
-            end;
-      until not FindNext(FindRec);
-    finally
-      FindClose(FindRec);
-    end;
-  end;
+  Result :=
+    (RegQueryDWordValue(HKLM64,
+       'SOFTWARE\Microsoft\VisualStudio\14.0\VC\Runtimes\x64',
+       'Installed', Installed) and (Installed = 1))
+    or (FileExists(ExpandConstant('{sys}\vcruntime140.dll')) and
+        FileExists(ExpandConstant('{sys}\msvcp140.dll')));
 end;
 
-function NeedsDotNetRuntime: Boolean;
+function NeedsVCRedist: Boolean;
 begin
-  if not RuntimeChecked then
+  if not VCRedistChecked then
   begin
-    RuntimeMissing := not DetectDotNetRuntime;
-    RuntimeChecked := True;
+    VCRedistMissing := not DetectVCRedist;
+    VCRedistChecked := True;
   end;
-  Result := RuntimeMissing;
+  Result := VCRedistMissing;
 end;
 
 { [Run] stavka za runtime se izvrsava samo ako je fajl stvarno preuzet -
   stiti od pada kada preuzimanje ne uspije a korisnik izabere nastavak. }
-function RuntimeInstallerDownloaded: Boolean;
+function VCRedistInstallerDownloaded: Boolean;
 begin
-  Result := NeedsDotNetRuntime and
-            FileExists(ExpandConstant('{tmp}\dotnet-desktop-runtime.exe'));
+  Result := NeedsVCRedist and
+            FileExists(ExpandConstant('{tmp}\vc_redist.x64.exe'));
 end;
 
 procedure InitializeWizard;
 begin
   DownloadPage := CreateDownloadPage(
     SetupMessage(msgWizardPreparing),
-    'Setup is downloading the .NET {#DotNetMajor} Desktop Runtime, which SharpView requires.',
+    'Setup is downloading the Microsoft Visual C++ Runtime, which SharpView''s RAW (NEF) support requires.',
     nil);
 end;
 
@@ -219,21 +211,23 @@ function NextButtonClick(CurPageID: Integer): Boolean;
 begin
   Result := True;
 
-  if (CurPageID = wpReady) and NeedsDotNetRuntime then
+  if (CurPageID = wpReady) and NeedsVCRedist then
   begin
     DownloadPage.Clear;
-    DownloadPage.Add('{#DotNetUrl}', 'dotnet-desktop-runtime.exe', '');
+    DownloadPage.Add('{#VCRedistUrl}', 'vc_redist.x64.exe', '');
     DownloadPage.Show;
     try
       try
         DownloadPage.Download;
       except
-        { Preuzimanje nije uspjelo - ponudi nastavak, jer korisnik runtime
-          moze instalirati rucno sa microsoft.com }
+        { Preuzimanje nije uspjelo - ponudi nastavak: aplikacija radi i bez
+          toga, samo RAW (NEF) podrska nece biti dostupna dok se runtime ne
+          instalira rucno. }
         if SuppressibleMsgBox(
-             'Could not download the .NET Desktop Runtime:' + #13#10#13#10 +
+             'Could not download the Microsoft Visual C++ Runtime:' + #13#10#13#10 +
              GetExceptionMessage + #13#10#13#10 +
-             'You can install it manually from https://dotnet.microsoft.com/download' + #13#10 +
+             'SharpView will work without it, but RAW (NEF) support will be unavailable.' + #13#10 +
+             'You can install it manually from https://aka.ms/vs/17/release/vc_redist.x64.exe' + #13#10 +
              'Continue installing SharpView anyway?',
              mbError, MB_YESNO, IDYES) = IDNO then
           Result := False;
@@ -292,5 +286,6 @@ begin
     CleanExplorerCacheForExt('.webp');
     CleanExplorerCacheForExt('.ico');
     CleanExplorerCacheForExt('.heic');
+    CleanExplorerCacheForExt('.nef');
   end;
 end;
