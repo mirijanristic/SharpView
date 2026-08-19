@@ -14,16 +14,19 @@ sealed class ThumbnailStrip
     readonly ThumbnailCache _cache;
 
     // Layout constants
-    /// <summary>Height of the strip band itself.</summary>
-    public const int StripHeight = 85;
-    /// <summary>Gap between the strip and the bottom window edge. In fullscreen the
-    /// taskbar shows through the translucent backdrop exactly there, so the strip
-    /// is lifted above it to stay readable.</summary>
-    public const int BottomMargin = 5;
-    /// <summary>Total vertical space reserved at the bottom (strip + margin) —
-    /// the main image viewport must stay above this.</summary>
-    public const int ReservedHeight = StripHeight + BottomMargin;
     const int ThumbSize = ThumbnailCache.ThumbnailSize; // squares drawn 1:1 at decode size
+    /// <summary>Breathing room above AND below the thumbnails inside the band.</summary>
+    const int ThumbPadding = 10;
+    /// <summary>Height of the strip band itself: thumbnails + equal padding on
+    /// both sides. The band sits flush with the bottom window edge (no extra
+    /// margin — the band background makes it a solid bar, so lifting it above
+    /// the see-through taskbar zone no longer serves a purpose).</summary>
+    public const int StripHeight = ThumbSize + ThumbPadding * 2;
+    /// <summary>Kept for call sites; the band is flush with the bottom edge.</summary>
+    public const int BottomMargin = 0;
+    /// <summary>Total vertical space reserved at the bottom —
+    /// the image input zone ends above this (the image itself draws under it).</summary>
+    public const int ReservedHeight = StripHeight + BottomMargin;
     const int CellWidth = 65;       // cell width including padding
     const int BorderWidth = 2;
 
@@ -44,9 +47,12 @@ sealed class ThumbnailStrip
     //   1..32    thumbnails (up to MaxVisibleThumbs)
     //   33..36   selection border quads
     //   37..40   hover top bar (see TopBar)
+    //   41..42   live-resize underlay + frozen-resize veil (ImageRenderer/App)
+    //   43       strip band background
     const int CbSlotThumbStart = 1;
     const int MaxVisibleThumbs = 32;
     const int CbSlotBorderStart = CbSlotThumbStart + MaxVisibleThumbs; // 33
+    const int CbSlotBackground = 43;
 
     public ThumbnailStrip(DeviceResources res, ThumbnailCache cache)
     {
@@ -92,11 +98,16 @@ sealed class ThumbnailStrip
         // below it stays empty so the strip clears the see-through taskbar area.
         float stripY = windowHeight - ReservedHeight;
 
-        // No background quad on purpose: the strip area keeps the same translucent
-        // backdrop as the rest of the window and the thumbnails float on it.
-        // (If a background ever returns, don't fade it out with tint a = 0 —
-        // TintColor.a is the shader's solid-color mode flag, so a = 0 falls
-        // through to texture mode and paints the white texture as an opaque bar.)
+        // Band background: the image is laid out over the full window and runs
+        // UNDERNEATH the strip, darkened here with exactly the top bar's shade
+        // (TopBar.BarColor) so both overlays read as one visual language. The
+        // quad covers the whole reserved band down to the window edge.
+        // (Never fade this out with tint a = 0 — TintColor.a is the shader's
+        // solid-color mode flag, so a = 0 falls through to texture mode and
+        // paints the white texture as an opaque bar.)
+        WriteRectConstants(CbSlotBackground, 0, stripY, windowWidth, ReservedHeight,
+            windowWidth, windowHeight, TopBar.BarColor);
+        _res.DrawQuad(_res.WhiteSrvSlot, CbSlotBackground);
 
         // 1. Visible thumbnails
         var (firstVisible, lastVisible) = GetVisibleRange(windowWidth);

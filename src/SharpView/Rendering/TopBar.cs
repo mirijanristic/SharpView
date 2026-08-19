@@ -32,7 +32,9 @@ sealed class TopBar
     const int CbSlotStrokeA = 39;
     const int CbSlotStrokeB = 40;
 
-    static readonly Vector4 BarColor = new(0.05f, 0.05f, 0.05f, 0.85f);
+    /// <summary>Shared overlay shade: the thumbnail strip's band background
+    /// uses this exact color so both bars read as one visual language.</summary>
+    internal static readonly Vector4 BarColor = new(0.05f, 0.05f, 0.05f, 0.85f);
     static readonly Vector4 CloseHoverColor = new(0.91f, 0.07f, 0.14f, 1.0f); // #E81123
     static readonly Vector4 StrokeColor = new(0.92f, 0.92f, 0.92f, 1.0f);
 

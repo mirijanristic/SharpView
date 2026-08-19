@@ -132,6 +132,10 @@ sealed class ViewerApp : IDisposable
     /// <summary>Height of the main image area: from the very top of the window
     /// (the hover top bar OVERLAYS the image rather than reserving space for
     /// itself) down to the thumbnail strip's reserved bottom band.</summary>
+    // Input split only: clicks/wheel above this line belong to the image,
+    // below it to the thumbnail strip. The image itself is laid out and DRAWN
+    // over the FULL window height — both bars (hover top bar, thumbnail strip)
+    // are translucent overlays on top of it, sharing the same shade.
     int MainViewHeight => _height - ThumbnailStrip.ReservedHeight;
 
     /// <summary>True when a window-space Y lies inside the main image area.</summary>
@@ -212,11 +216,11 @@ sealed class ViewerApp : IDisposable
         {
             if (_firstImageShown)
             {
-                _imageRenderer.FitOrOneToOne(_width, MainViewHeight);
+                _imageRenderer.FitOrOneToOne(_width, _height);
             }
             else
             {
-                _imageRenderer.FitOrOneToOneInstant(_width, MainViewHeight);
+                _imageRenderer.FitOrOneToOneInstant(_width, _height);
                 _firstImageShown = true;
             }
         }
@@ -231,7 +235,7 @@ sealed class ViewerApp : IDisposable
                 "SharpView", NativeMethods.MB_OK | NativeMethods.MB_ICONWARNING);
         }
 
-        _imageRenderer.Update(dt, _width, MainViewHeight);
+        _imageRenderer.Update(dt, _width, _height);
         _thumbStrip.Update(dt, _width, _height, _nav);
 
         // Hover top bar: polled rather than event-driven, because its caption zone
@@ -288,10 +292,10 @@ sealed class ViewerApp : IDisposable
         if (_frozenResize)
             DrawFrozenVeil();
 
-        // Main image (from the top of the window down to the strip band; the
-        // hover top bar is drawn later as an overlay on top of it). The view
+        // Main image over the FULL window — the strip band and the hover top
+        // bar are translucent overlays drawn on top of it below. The view
         // offsets are non-zero only during the frozen-resize gesture.
-        _res.SetViewportAndScissor(_viewOffsetX, _viewOffsetY, _width, MainViewHeight);
+        _res.SetViewportAndScissor(_viewOffsetX, _viewOffsetY, _width, _height);
         _imageRenderer.Render();
 
         // Thumbnail strip (window-sized viewport for pixel-coordinate rendering)
@@ -511,7 +515,7 @@ sealed class ViewerApp : IDisposable
         // from the very top, so window Y and viewport Y are the same thing).
         if (InMainView(y))
         {
-            _imageRenderer.ZoomAt(delta, x, y, _width, MainViewHeight);
+            _imageRenderer.ZoomAt(delta, x, y, _width, _height);
             Wake();
         }
     }
@@ -581,7 +585,7 @@ sealed class ViewerApp : IDisposable
         if (!_imageRenderer.IsOneToOne)
             _imageRenderer.SetOneToOne();
         else
-            _imageRenderer.FitToWindow(_width, MainViewHeight);
+            _imageRenderer.FitToWindow(_width, _height);
         Wake();
     }
 
@@ -610,7 +614,7 @@ sealed class ViewerApp : IDisposable
                 return true;
 
             case NativeMethods.VK_0 or NativeMethods.VK_NUMPAD0:
-                _imageRenderer.FitToWindow(_width, MainViewHeight);
+                _imageRenderer.FitToWindow(_width, _height);
                 return true;
             case NativeMethods.VK_1 or NativeMethods.VK_NUMPAD1:
                 _imageRenderer.SetOneToOne();
