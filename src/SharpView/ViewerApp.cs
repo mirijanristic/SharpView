@@ -67,6 +67,8 @@ sealed class ViewerApp : IDisposable
             $"SharpView — {Path.GetFileName(imagePath)}", x, y, restoredW, restoredH);
 
         _window.Resized += () => { _needsResize = true; Wake(); };
+        _window.LiveResize = OnLiveResize;
+        _window.SizeMoveEnded = () => _res.EndLiveResize();
         _window.CloseRequested += () => _running = false;
         _window.MouseWheel = OnMouseWheel;
         _window.MouseDown = OnMouseDown;
@@ -242,6 +244,33 @@ sealed class ViewerApp : IDisposable
         if (_thumbCache.HasPendingUploads)
             _thumbCache.ProcessUploads(_res.CommandList);
 
+        // Live-resize camouflage: extend the frame into the bands OUTSIDE the
+        // current window layout (right/bottom of the oversized buffer) with
+        // "what a bigger window would show, without re-centering": the clear
+        // already put the backdrop veil there, and the image is redrawn at its
+        // exact same pixel position — its true continuation where it reaches
+        // the window edge, untouched veil where it is letterboxed. The one
+        // geometry-outruns-content composition pass then reveals pixels that
+        // blend seamlessly with their surroundings. Inside the window nothing
+        // is drawn (scissor), so normal rendering stays pixel-identical.
+        if (_window.InSizeMove
+            && (_res.BufferWidth > _width || _res.BufferHeight > _height))
+        {
+            // Viewport spans the full buffer so pixel coordinates line up with
+            // the in-window draw; the scissor clips to one band per draw.
+            _res.SetViewportAndScissor(0, 0, _res.BufferWidth, _res.BufferHeight);
+            if (_res.BufferWidth > _width)
+            {
+                _res.SetScissor(_width, 0, _res.BufferWidth - _width, _res.BufferHeight);
+                _imageRenderer.RenderUnderlay(_res.BufferWidth, _res.BufferHeight);
+            }
+            if (_res.BufferHeight > _height)
+            {
+                _res.SetScissor(0, _height, _width, _res.BufferHeight - _height);
+                _imageRenderer.RenderUnderlay(_res.BufferWidth, _res.BufferHeight);
+            }
+        }
+
         // Main image (from the top of the window down to the strip band; the
         // hover top bar is drawn later as an overlay on top of it)
         _res.SetViewportAndScissor(0, 0, _width, MainViewHeight);
@@ -265,6 +294,53 @@ sealed class ViewerApp : IDisposable
         _res.Resize(w, h);
         _width = w;
         _height = h;
+    }
+
+    /// <summary>
+    /// Per-tick redraw during an interactive edge/corner resize. Invoked
+    /// synchronously from the WndProc — with the NEW client size, from
+    /// WM_NCCALCSIZE, before the window geometry is applied — while Run()'s
+    /// loop is blocked inside the system's modal resize loop, so this IS the
+    /// render loop for that duration.
+    /// </summary>
+    void OnLiveResize(int width, int height)
+    {
+        if (_imageRenderer is null) return; // pre-init safety; cannot happen post-Show
+        if (width <= 0 || height <= 0) return;
+
+        // First tick of the gesture sizes the buffers for the whole gesture
+        // (idempotent afterwards); every tick then renders the window-sized
+        // layout into the oversized buffer and the window clips the rest —
+        // no reallocation, no per-tick GPU-wait-for-rebuild, no scaling.
+        // Sized to the VIRTUAL screen, not the current monitor: dragging the
+        // left edge onto the neighboring monitor makes the window wider than
+        // any single monitor, and a too-small buffer would fall back to a full
+        // reallocation on every tick — the expensive-tick regime whose flicker
+        // this whole mechanism exists to kill (plus the camouflage band would
+        // vanish). Memory is transient: released with the first resize after
+        // the gesture ends.
+        int reachW = Math.Max(NativeMethods.GetSystemMetrics(NativeMethods.SM_CXVIRTUALSCREEN), width);
+        int reachH = Math.Max(NativeMethods.GetSystemMetrics(NativeMethods.SM_CYVIRTUALSCREEN), height);
+        _res.BeginLiveResize(reachW, reachH);
+
+        _res.Resize(width, height);
+        _width = width;
+        _height = height;
+
+        Update();
+        RenderFrame();
+
+        // The GPU wait turns "queued" into "complete" BEFORE the geometry
+        // lands, so every applied window rect is preceded by its finished
+        // frame. Deliberately no DwmFlush here: with ticks this cheap it only
+        // inserted a forced full-composition gap between "frame ready" and
+        // "geometry applied" — a window in which DWM could compose the stale
+        // pair, which read as the centered image oscillating. Tightly paired
+        // ticks keep content and geometry in lockstep; the scissored underlay
+        // camouflages the residual race DWM cannot eliminate.
+        _res.WaitForGpu();
+
+        Wake(); // a few follow-up frames once the loop resumes
     }
 
     void NavigateToImage()

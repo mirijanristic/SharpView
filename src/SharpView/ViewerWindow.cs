@@ -28,6 +28,11 @@ namespace SharpView;
 /// follows the mouse) is implemented manually in the WM_NCLBUTTONDOWN /
 /// mouse-move handlers — the system move loop refuses to move a maximized
 /// window and, for a borderless one, never performs the restore by itself.
+/// The window carries WS_THICKFRAME (visible frame removed via WM_NCCALCSIZE),
+/// which buys edge/corner resizing with native cursors AND makes the shell
+/// treat it as snappable: Snap Layouts on drag-to-top, side snapping and
+/// Win+Arrows. On Windows 11 the style also brings native rounded corners and
+/// the DWM shadow; opt out with DWMWA_WINDOW_CORNER_PREFERENCE if ever unwanted.
 /// Single-window design on purpose: the WndProc reaches the instance through a
 /// static field, no GWLP_USERDATA bookkeeping needed.
 /// </remarks>
@@ -46,7 +51,14 @@ sealed unsafe class ViewerWindow : IDisposable
     bool _pendingDragRestore;
     NativeMethods.POINT _dragRestoreStart;
 
+    // True between WM_ENTERSIZEMOVE and WM_EXITSIZEMOVE — the window is inside
+    // the system's modal move/size loop and the app loop is blocked.
+    bool _inSizeMove;
+
     public IntPtr Handle => _hwnd;
+
+    /// <summary>True while inside the system's modal move/size loop.</summary>
+    public bool InSizeMove => _inSizeMove;
 
     /// <summary>Return true if the key (virtual-key code) was handled; false for
     /// default processing (Alt+F4, ...).</summary>
@@ -67,9 +79,29 @@ sealed unsafe class ViewerWindow : IDisposable
     /// <summary>Client size changed (resize, maximize/restore, DPI move).</summary>
     public Action? Resized;
 
+    /// <summary>
+    /// Called SYNCHRONOUSLY for every size tick during an interactive edge/corner
+    /// resize, while the app's own loop is blocked inside the system's modal
+    /// resize loop — with the NEW client size, from WM_NCCALCSIZE, i.e. BEFORE
+    /// the window geometry is applied. That ordering is the whole point: DWM
+    /// commits window-rect changes and swap chain frames independently, so a
+    /// frame rendered after the move (from WM_SIZE) lags one composition behind
+    /// and the edge OPPOSITE the dragged one visibly wobbles on left/top
+    /// resizes. Rendering here — and finishing the frame (GPU wait) before
+    /// returning — lets DWM compose the new geometry and the new content
+    /// together. The handler must resize the swap chain to the given size,
+    /// render one frame, and not return until the frame is complete.
+    /// </summary>
+    public Action<int, int>? LiveResize;
+
     /// <summary>The user asked to close (Alt+F4 / system menu). The app decides;
     /// the window is destroyed in <see cref="Dispose"/>.</summary>
     public Action? CloseRequested;
+
+    /// <summary>The modal move/size loop ended — the app leaves live-resize mode
+    /// here, BEFORE the follow-up <see cref="Resized"/> does the final exact-size
+    /// pass.</summary>
+    public Action? SizeMoveEnded;
 
     /// <summary>Mouse capture was taken away mid-drag (Alt-Tab, ...) — end the pan.</summary>
     public Action? CaptureLost;
@@ -104,6 +136,7 @@ sealed unsafe class ViewerWindow : IDisposable
             ClassName, title,
             NativeMethods.WS_POPUP | NativeMethods.WS_SYSMENU
                 | NativeMethods.WS_MINIMIZEBOX | NativeMethods.WS_MAXIMIZEBOX
+                | NativeMethods.WS_THICKFRAME // resizable + snappable; frame removed in WM_NCCALCSIZE
                 | NativeMethods.WS_CLIPCHILDREN | NativeMethods.WS_CLIPSIBLINGS,
             x, y, width, height,
             IntPtr.Zero, IntPtr.Zero, instance, IntPtr.Zero);
@@ -144,6 +177,22 @@ sealed unsafe class ViewerWindow : IDisposable
         NativeMethods.GetClientRect(_hwnd, out var rect);
         width = rect.Width;
         height = rect.Height;
+    }
+
+    /// <summary>Full pixel size of the monitor the window currently occupies —
+    /// the upper bound a single resize gesture can reach without changing
+    /// monitors (and buffer growth covers even that rare case).</summary>
+    public void GetMonitorSize(out int width, out int height)
+    {
+        IntPtr monitor = NativeMethods.MonitorFromWindow(_hwnd, 2 /* NEAREST */);
+        var info = new NativeMethods.MONITORINFO { cbSize = (uint)sizeof(NativeMethods.MONITORINFO) };
+        if (monitor != IntPtr.Zero && NativeMethods.GetMonitorInfo(monitor, ref info))
+        {
+            width = info.rcMonitor.Width;
+            height = info.rcMonitor.Height;
+            return;
+        }
+        GetClientSize(out width, out height);
     }
 
     /// <summary>Cursor position in client pixels + whether it is inside the client
@@ -217,13 +266,72 @@ sealed unsafe class ViewerWindow : IDisposable
     {
         switch (msg)
         {
-            case NativeMethods.WM_NCHITTEST when HitTestHandler is not null:
+            case NativeMethods.WM_NCCALCSIZE when wParam != 0:
+            {
+                // wParam TRUE: lParam points at NCCALCSIZE_PARAMS whose first
+                // field is rgrc[0] = the proposed WINDOW rect; on return it must
+                // hold the CLIENT rect. Returning 0 with the rect untouched
+                // claims the whole window as client — that removes the visible
+                // frame WS_THICKFRAME would otherwise paint. When maximized, the
+                // system may inflate the window past the monitor by the frame
+                // width; clamping to the monitor keeps the client (top bar,
+                // thumbnail strip) fully on-screen. Intersection only ever
+                // shrinks, so it is correct for both maximize geometries a
+                // caption-less window can get.
+                var rect = (NativeMethods.RECT*)lParam;
+                if (NativeMethods.IsZoomed(hwnd))
+                {
+                    IntPtr monitor = NativeMethods.MonitorFromWindow(hwnd, 2 /* NEAREST */);
+                    var info = new NativeMethods.MONITORINFO { cbSize = (uint)sizeof(NativeMethods.MONITORINFO) };
+                    if (monitor != IntPtr.Zero && NativeMethods.GetMonitorInfo(monitor, ref info))
+                    {
+                        rect->Left = Math.Max(rect->Left, info.rcMonitor.Left);
+                        rect->Top = Math.Max(rect->Top, info.rcMonitor.Top);
+                        rect->Right = Math.Min(rect->Right, info.rcMonitor.Right);
+                        rect->Bottom = Math.Min(rect->Bottom, info.rcMonitor.Bottom);
+                    }
+                }
+
+                // Interactive resize: render at the NEW size right now, before
+                // the geometry lands (see LiveResize). *rect is exactly the
+                // client rect being returned. (Snap-maximize mid-drag comes
+                // through here too, already clamped above — also handled.)
+                if (_inSizeMove && LiveResize is not null
+                    && rect->Width > 0 && rect->Height > 0)
+                {
+                    LiveResize(rect->Width, rect->Height);
+                }
+                return 0;
+            }
+
+            case NativeMethods.WM_GETMINMAXINFO:
+            {
+                // Only the minimum size is pinned; maximize geometry stays at the
+                // system default (full monitor for a caption-less window) with
+                // WM_NCCALCSIZE clamping any frame overhang.
+                var mmi = (NativeMethods.MINMAXINFO*)lParam;
+                mmi->MinTrackSize.X = 640;
+                mmi->MinTrackSize.Y = 400;
+                return 0;
+            }
+
+            case NativeMethods.WM_NCHITTEST:
             {
                 // lParam packs SCREEN coords as signed shorts (monitors left of /
                 // above the primary yield negative values).
                 var pt = new NativeMethods.POINT { X = LoWordX(lParam), Y = HiWordY(lParam) };
                 NativeMethods.ScreenToClient(hwnd, ref pt);
-                int hit = HitTestHandler(pt.X, pt.Y);
+
+                // Resize bands first: the outer ~8 px ring (and its corners)
+                // belongs to sizing, so the top band wins over the caption there —
+                // exactly how framed windows behave. Never while maximized.
+                if (!NativeMethods.IsZoomed(hwnd))
+                {
+                    int edge = ResizeBorderHitTest(pt.X, pt.Y);
+                    if (edge != 0) return edge;
+                }
+
+                int hit = HitTestHandler?.Invoke(pt.X, pt.Y) ?? 0;
                 if (hit != 0) return hit;
                 break; // 0 → default handling
             }
@@ -303,11 +411,25 @@ sealed unsafe class ViewerWindow : IDisposable
                 }
                 break;
 
+            case NativeMethods.WM_ENTERSIZEMOVE:
+                _inSizeMove = true;
+                break;
+
             case NativeMethods.WM_SIZE:
+                // During an interactive resize the frame for this tick was
+                // already rendered in WM_NCCALCSIZE (before the move landed) —
+                // rendering again here would just add a stale-lag frame back.
+                if (_inSizeMove && wParam != 1 && LiveResize is not null)
+                    return 0;
+                Resized?.Invoke(); // normal path: maximize/restore/DPI, app loop running
+                break;
+
             case NativeMethods.WM_EXITSIZEMOVE:
-                // WM_SIZE covers maximize/restore/DPI moves; EXITSIZEMOVE is a
-                // cheap safety net after a native move loop (same-size resizes
-                // dedupe in DeviceResources anyway).
+                _inSizeMove = false;
+                SizeMoveEnded?.Invoke();
+                // Safety net after a native move/size loop: one regular resize
+                // pass through the app loop (same-size requests dedupe in
+                // DeviceResources anyway).
                 Resized?.Invoke();
                 break;
 
@@ -337,6 +459,37 @@ sealed unsafe class ViewerWindow : IDisposable
         }
 
         return NativeMethods.DefWindowProc(hwnd, msg, wParam, lParam);
+    }
+
+    // ─── Resize borders ────────────────────────────────────────────────
+
+    /// <summary>
+    /// Maps a client-space point to a resize hit-test code when it lies within
+    /// the border band along the window edges; 0 otherwise. The client covers
+    /// the whole window (WM_NCCALCSIZE), so client edges ARE window edges.
+    /// </summary>
+    int ResizeBorderHitTest(int x, int y)
+    {
+        NativeMethods.GetClientRect(_hwnd, out var client);
+        int bandX = Math.Max(4, NativeMethods.GetSystemMetrics(NativeMethods.SM_CXSIZEFRAME)
+                              + NativeMethods.GetSystemMetrics(NativeMethods.SM_CXPADDEDBORDER));
+        int bandY = Math.Max(4, NativeMethods.GetSystemMetrics(NativeMethods.SM_CYSIZEFRAME)
+                              + NativeMethods.GetSystemMetrics(NativeMethods.SM_CXPADDEDBORDER));
+
+        bool left = x < bandX;
+        bool right = x >= client.Width - bandX;
+        bool top = y < bandY;
+        bool bottom = y >= client.Height - bandY;
+
+        if (top && left) return NativeMethods.HTTopLeft;
+        if (top && right) return NativeMethods.HTTopRight;
+        if (bottom && left) return NativeMethods.HTBottomLeft;
+        if (bottom && right) return NativeMethods.HTBottomRight;
+        if (left) return NativeMethods.HTLeft;
+        if (right) return NativeMethods.HTRight;
+        if (top) return NativeMethods.HTTop;
+        if (bottom) return NativeMethods.HTBottom;
+        return 0;
     }
 
     // ─── Drag-restore from maximized ───────────────────────────────────

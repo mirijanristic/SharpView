@@ -15,6 +15,8 @@ internal static unsafe partial class NativeMethods
 
     public const uint WM_DESTROY = 0x0002;
     public const uint WM_SIZE = 0x0005;
+    public const uint WM_GETMINMAXINFO = 0x0024;
+    public const uint WM_NCCALCSIZE = 0x0083;
     public const uint WM_CLOSE = 0x0010;
     public const uint WM_QUIT = 0x0012;
     public const uint WM_ERASEBKGND = 0x0014;
@@ -32,6 +34,7 @@ internal static unsafe partial class NativeMethods
     public const uint WM_LBUTTONDBLCLK = 0x0203;
     public const uint WM_MOUSEWHEEL = 0x020A;
     public const uint WM_CAPTURECHANGED = 0x0215;
+    public const uint WM_ENTERSIZEMOVE = 0x0231;
     public const uint WM_EXITSIZEMOVE = 0x0232;
     public const uint WM_DPICHANGED = 0x02E0;
 
@@ -42,10 +45,26 @@ internal static unsafe partial class NativeMethods
     /// <summary>Caption — Windows handles dragging, snapping, drag-restore.</summary>
     public const int HTCaption = 2;
 
+    // Resize borders: returning these makes the system show the proper sizing
+    // cursors and run its native resize loop — no manual resize code needed.
+    public const int HTLeft = 10;
+    public const int HTRight = 11;
+    public const int HTTop = 12;
+    public const int HTTopLeft = 13;
+    public const int HTTopRight = 14;
+    public const int HTBottom = 15;
+    public const int HTBottomLeft = 16;
+    public const int HTBottomRight = 17;
+
     // ─── Window styles ─────────────────────────────────────────────────
 
     public const uint WS_POPUP = 0x80000000;
     public const uint WS_SYSMENU = 0x00080000;      // right-click system menu on the caption zone
+    /// <summary>Marks the window resizable. Required twice over: for the edge/corner
+    /// resize hit-test codes to enter the native resize loop, AND for the shell to
+    /// treat the window as snappable (Snap Layouts on drag-to-top, side snapping,
+    /// Win+Arrows). The visible frame it would paint is removed in WM_NCCALCSIZE.</summary>
+    public const uint WS_THICKFRAME = 0x00040000;
     public const uint WS_MINIMIZEBOX = 0x00020000;
     public const uint WS_MAXIMIZEBOX = 0x00010000;
     public const uint WS_CLIPCHILDREN = 0x02000000;
@@ -78,6 +97,17 @@ internal static unsafe partial class NativeMethods
     /// <summary>Drag threshold before a press counts as a drag (typ. 4 px).</summary>
     public const int SM_CXDRAG = 68;
     public const int SM_CYDRAG = 69;
+
+    /// <summary>Sizing-frame metrics: SM_C{X,Y}SIZEFRAME + SM_CXPADDEDBORDER is the
+    /// standard border thickness (~8 px at 100 % DPI) used for the resize bands.</summary>
+    public const int SM_CXSIZEFRAME = 32;
+    public const int SM_CYSIZEFRAME = 33;
+    public const int SM_CXPADDEDBORDER = 92;
+
+    /// <summary>Bounding box of ALL monitors — the true upper bound a resize
+    /// gesture can reach (a window may span monitors mid-gesture).</summary>
+    public const int SM_CXVIRTUALSCREEN = 78;
+    public const int SM_CYVIRTUALSCREEN = 79;
 
     // ─── Virtual-key codes used by the viewer ──────────────────────────
 
@@ -142,6 +172,16 @@ internal static unsafe partial class NativeMethods
         public IntPtr lpszMenuName;
         public IntPtr lpszClassName;
         public IntPtr hIconSm;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct MINMAXINFO
+    {
+        public POINT Reserved;
+        public POINT MaxSize;
+        public POINT MaxPosition;
+        public POINT MinTrackSize;
+        public POINT MaxTrackSize;
     }
 
     [StructLayout(LayoutKind.Sequential)]
@@ -300,6 +340,9 @@ internal static unsafe partial class NativeMethods
     [LibraryImport("user32", EntryPoint = "MonitorFromPoint")]
     public static partial IntPtr MonitorFromPoint(POINT point, uint flags); // 2 = MONITOR_DEFAULTTONEAREST
 
+    [LibraryImport("user32", EntryPoint = "MonitorFromWindow")]
+    public static partial IntPtr MonitorFromWindow(IntPtr hwnd, uint flags); // 2 = MONITOR_DEFAULTTONEAREST
+
     [LibraryImport("user32", EntryPoint = "GetMonitorInfoW")]
     [return: MarshalAs(UnmanagedType.Bool)]
     public static partial bool GetMonitorInfo(IntPtr monitor, ref MONITORINFO info);
@@ -337,6 +380,15 @@ internal static unsafe partial class NativeMethods
         try { SetProcessDpiAwarenessContext((IntPtr)(-4) /* PER_MONITOR_AWARE_V2 */); }
         catch (EntryPointNotFoundException) { /* pre-1703 Windows 10 — accept system DPI */ }
     }
+
+    // ─── dwmapi ────────────────────────────────────────────────────────
+
+    /// <summary>Blocks until the next DWM composition pass. Used after presenting
+    /// a live-resize frame: only when a pass has run with the completed frame
+    /// available may WM_NCCALCSIZE return and let the window geometry land —
+    /// this pins content and geometry into the same composition.</summary>
+    [LibraryImport("dwmapi", EntryPoint = "DwmFlush")]
+    public static partial int DwmFlush();
 
     // ─── kernel32 / shell32 ────────────────────────────────────────────
 

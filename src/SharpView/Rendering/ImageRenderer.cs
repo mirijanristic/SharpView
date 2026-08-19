@@ -22,6 +22,13 @@ sealed class ImageRenderer : IDisposable
     ID3D12Resource? _texture;
     int _srvSlot = -1;
     const int CbSlot = 0;
+    // Live-resize camouflage pass (see RenderUnderlay). 41 = first slot past
+    // TopBar's block (37..40); ThumbnailStrip owns 1..36.
+    const int CbSlotUnderlay = 41;
+
+    // The image's destination rectangle in viewport pixels, as computed by the
+    // last Update — the underlay redraws the image at this exact position.
+    float _lastLeft, _lastTop, _lastDrawW, _lastDrawH;
 
     int _texW, _texH;
 
@@ -279,6 +286,11 @@ sealed class ImageRenderer : IDisposable
             top = MathF.Round(top);
         }
 
+        _lastLeft = left;
+        _lastTop = top;
+        _lastDrawW = drawW;
+        _lastDrawH = drawH;
+
         float sx = drawW / viewW;
         float sy = drawH / viewH;
         float tx = (left + drawW * 0.5f) / viewW * 2f - 1f;
@@ -300,6 +312,45 @@ sealed class ImageRenderer : IDisposable
     {
         if (_texture is null) return;
         _res.DrawQuad(_srvSlot, CbSlot);
+    }
+
+    /// <summary>
+    /// Live-resize camouflage: redraws the image at EXACTLY the same pixel
+    /// position as the normal in-window draw, but into a buffer-sized viewport
+    /// (the caller scissors it to the bands outside the current window). This
+    /// makes the band content "the frame as if the window were bigger, without
+    /// re-centering": where the image reaches the window edge, the band shows
+    /// its true continuation; where it does not (letterboxed images), nothing
+    /// is drawn and the band keeps the cleared backdrop veil — which is what
+    /// the margin next to it shows anyway. Either way, the one composition
+    /// pass where the window geometry outruns the content reveals pixels
+    /// indistinguishable from their surroundings. (A stretched-copy filler was
+    /// tried first: correct for edge-to-edge photos, but a letterboxed image
+    /// leaked a visible duplicate onto the veil.)
+    /// </summary>
+    public void RenderUnderlay(int bufferW, int bufferH)
+    {
+        if (_texture is null) return;
+        if (bufferW <= 0 || bufferH <= 0) return;
+
+        // Same destination rectangle as the last Update, re-expressed in the
+        // buffer-sized viewport's NDC. Viewport origins coincide (both 0,0),
+        // so viewport pixels ARE buffer pixels — the image lands pixel-exact.
+        float sx = _lastDrawW / bufferW;
+        float sy = _lastDrawH / bufferH;
+        float tx = (_lastLeft + _lastDrawW * 0.5f) / bufferW * 2f - 1f;
+        float ty = 1f - (_lastTop + _lastDrawH * 0.5f) / bufferH * 2f;
+
+        var xform = Matrix4x4.CreateScale(sx, sy, 1f)
+                  * Matrix4x4.CreateTranslation(tx, ty, 0f);
+
+        var cb = new ViewConstants
+        {
+            Transform = Matrix4x4.Transpose(xform),
+            TintColor = Vector4.Zero, // textured mode
+        };
+        _res.WriteConstants(CbSlotUnderlay, cb);
+        _res.DrawQuad(_srvSlot, CbSlotUnderlay);
     }
 
     // ─── Zoom/Pan Controls ────────────────────────────────────────────

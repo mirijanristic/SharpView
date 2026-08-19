@@ -75,6 +75,15 @@ sealed unsafe class DeviceResources : IDisposable
     // (notably the post-Show verification of the pre-sized startup swap chain).
     int _bufferWidth, _bufferHeight;
 
+    // Live-resize mode: buffers stay allocated at gesture-max while the window
+    // shrinks/grows underneath. No SetSourceSize here — on a COMPOSITION swap
+    // chain the visual shows content at buffer size and a smaller source region
+    // gets STRETCHED to it (magnified, deformed image). Instead the scene is
+    // rendered window-sized into the buffer's top-left and the window itself is
+    // the clip: DWM cuts the visual to the window rect, so exactly the top-left
+    // w×h shows, 1:1, with zero scaling anywhere.
+    bool _liveResize;
+
     // Constant buffer (one region of MaxCbSlots per frame in flight)
     ID3D12Resource _constantBuffer = null!;
     byte* _cbMapped;
@@ -101,6 +110,11 @@ sealed unsafe class DeviceResources : IDisposable
     bool _disposed;
 
     public int WhiteSrvSlot => _whiteSrvSlot;
+
+    /// <summary>Actual swap chain buffer size — larger than the window during a
+    /// live-resize gesture (the underlay pass needs to cover all of it).</summary>
+    public int BufferWidth => _bufferWidth;
+    public int BufferHeight => _bufferHeight;
 
     public bool IsWarp { get; private set; }
 
@@ -535,11 +549,29 @@ sealed unsafe class DeviceResources : IDisposable
         _cmdList.RSSetScissorRect(new RawRect((int)x, (int)y, (int)(x + w), (int)(y + h)));
     }
 
+    /// <summary>Scissor only, keeping the current viewport — used to clip a draw
+    /// (the live-resize underlay) to a sub-region of a larger viewport.</summary>
+    public void SetScissor(int x, int y, int w, int h)
+        => _cmdList.RSSetScissorRect(new RawRect(x, y, x + w, y + h));
+
     // ─── Resize ───────────────────────────────────────────────────────
 
     public void Resize(int width, int height)
     {
         if (width <= 0 || height <= 0) return;
+
+        // Live resize (interactive edge/corner sizing): the buffers were sized
+        // for the whole gesture up front, so a per-tick "resize" is a no-op at
+        // the swap chain level — the caller just renders the new window-sized
+        // layout into the buffer's top-left (its viewport already does that)
+        // and the window clips the rest. Microseconds instead of a full GPU
+        // wait plus buffer reallocation; cheap ticks are half of what keeps
+        // the left/top edges wobble-free.
+        if (_liveResize)
+        {
+            EnsureBufferCapacity(width, height); // rare: dragged onto a larger monitor
+            return;
+        }
 
         // Same size? Nothing to rebuild — and skipping the full GPU wait is what
         // keeps the pre-sized startup swap chain path completely stall-free.
@@ -558,6 +590,50 @@ sealed unsafe class DeviceResources : IDisposable
 
         _bufferWidth = width;
         _bufferHeight = height;
+    }
+
+    /// <summary>
+    /// Enter live-resize mode: the buffers grow once to cover the whole gesture
+    /// (typically the monitor size) and stay put; every following
+    /// <see cref="Resize"/> becomes free — the window itself clips the
+    /// oversized content. Idempotent — safe to call on every resize tick.
+    /// </summary>
+    public void BeginLiveResize(int maxWidth, int maxHeight)
+    {
+        _liveResize = true;
+        EnsureBufferCapacity(maxWidth, maxHeight);
+    }
+
+    /// <summary>
+    /// Leave live-resize mode. The regular <see cref="Resize"/> the app fires
+    /// right after the gesture reallocates the buffers to the exact final size,
+    /// releasing the gesture-sized surplus (or is a free no-op when the gesture
+    /// ended exactly at buffer size, e.g. a snap-maximize).
+    /// </summary>
+    public void EndLiveResize() => _liveResize = false;
+
+    /// <summary>Grow (never shrink) the buffers. Growth is rounded up to 256 px
+    /// chunks: it should never trigger mid-gesture (capacity covers the virtual
+    /// screen up front), but if it ever does — monitor topology changing under a
+    /// live gesture — the rounding turns a per-tick reallocation storm into a
+    /// single one.</summary>
+    void EnsureBufferCapacity(int width, int height)
+    {
+        static int RoundUp(int value) => (value + 255) & ~255;
+
+        int newWidth = _bufferWidth >= width ? _bufferWidth : RoundUp(width);
+        int newHeight = _bufferHeight >= height ? _bufferHeight : RoundUp(height);
+        if (newWidth == _bufferWidth && newHeight == _bufferHeight) return;
+
+        WaitForGpu();
+        for (int i = 0; i < FrameCount; i++)
+        { _renderTargets[i]?.Dispose(); _renderTargets[i] = null!; }
+        SwapChain.ResizeBuffers(FrameCount, (uint)newWidth, (uint)newHeight,
+            BackBufferFormat, SwapChainFlags.None);
+        _frameIndex = (int)SwapChain.CurrentBackBufferIndex;
+        CreateRenderTargets();
+        _bufferWidth = newWidth;
+        _bufferHeight = newHeight;
     }
 
     /// <summary>
