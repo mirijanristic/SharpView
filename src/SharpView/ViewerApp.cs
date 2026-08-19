@@ -242,8 +242,12 @@ sealed class ViewerApp : IDisposable
         // produces no client WM_MOUSEMOVE and the mouse can leave the window
         // sideways (toward the other monitor) without any message at all. Hidden
         // while dragging so the bar stays out of the way of a pan near the top edge.
+        // Deliberately NOT gated on window focus: mouse hover follows position,
+        // not activation (WM_NCMOUSEMOVE arrives and wakes the loop either way),
+        // and unfocused-hover feedback is standard Windows behavior — Explorer
+        // and Chrome light up controls on inactive windows too.
         _window.GetCursorClientPosition(out int cx, out int cy, out bool insideClient);
-        bool cursorAvailable = !_dragging && _window.IsForeground && insideClient;
+        bool cursorAvailable = !_dragging && insideClient;
         _topBar.Update(dt, _width, cx, cy, cursorAvailable, _window.IsMaximized);
     }
 
