@@ -3,20 +3,40 @@
   <PropertyGroup>
     <OutputType>WinExe</OutputType>
     <TargetFramework>net10.0-windows</TargetFramework>
-    <UseWindowsForms>true</UseWindowsForms>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <PlatformTarget>x64</PlatformTarget>
     <RootNamespace>SharpView</RootNamespace>
     <AssemblyName>SharpView</AssemblyName>
 
-    <!-- WinForms bootstrap (consumed by ApplicationConfiguration.Initialize()) -->
-    <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
-    <ApplicationVisualStyles>true</ApplicationVisualStyles>
-    <ApplicationUseCompatibleTextRendering>false</ApplicationUseCompatibleTextRendering>
+    <!-- Pure Win32 shell (ViewerWindow + NativeMethods) — no WinForms/WPF.
+         DPI + visual styles now come from app.manifest instead of the old
+         WinForms bootstrap properties. -->
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+
+    <!-- ─── Native AOT ───
+         Publish compiles the whole app (runtime included) to a single native
+         exe: no JIT, no installed .NET needed, instant startup. Everyday
+         `dotnet build` / F5 still runs on CoreCLR (fast iteration) — AOT only
+         happens on `dotnet publish -r win-x64`, which requires the MSVC linker
+         ("Desktop development with C++" workload). PublishAot also turns on the
+         AOT/trim analyzers during normal builds, so incompatible code is
+         flagged at development time, not at publish time.
+         Win32 resources (app.ico, version info) and app.manifest are embedded
+         into the native exe as well, so the DPI declaration survives AOT.
+         Deliberately NOT set: InvariantGlobalization — on Windows .NET uses the
+         OS ICU (no size win) and it could subtly change case-insensitive
+         sorting of non-ASCII file names (š/đ/č) in the folder strip. -->
+    <PublishAot>true</PublishAot>
+    <OptimizationPreference>Speed</OptimizationPreference>
 
     <Product>SharpView</Product>
     <Description>GPU-accelerated image viewer built on Direct3D 12</Description>
     <ApplicationIcon>app.ico</ApplicationIcon>
+
+    <!-- SharpGen.Runtime (Vortice) nije trim-anotiran (IL2104/IL2067/72/87);
+     assembly je rootovan pa refleksija garantovano nalazi vtbl polja —
+     runtime provjereno pod AOT-om. -->
+    <NoWarn>$(NoWarn);IL2104</NoWarn>
   </PropertyGroup>
 
   <ItemGroup>
@@ -30,12 +50,26 @@
     <PackageReference Include="Vortice.DirectComposition" Version="3.8.2" />
     <PackageReference Include="Vortice.Mathematics" Version="2.1.0" />
 
+    <!-- GDI+ fallback in ImageDecoder (Bitmap/Graphics). Previously flowed in via
+         UseWindowsForms; with the WinForms host gone it is an explicit package.
+         Any 10.0.x works. -->
+    <PackageReference Include="System.Drawing.Common" Version="10.0.0" />
+
     <!-- LibRaw native binaries for camera RAW decoding (RawDecoder): raw_r.dll
          (thread-safe LibRaw 0.21.1 build) + lcms2/zlib1/jpeg8 dependencies. The
          package's targets copy the dlls next to the exe — no manual steps.
          License note: the native binaries are LGPL-2.1-only OR CDDL-1.0
          (dynamically linked, compatible with this project's MIT license). -->
-    <PackageReference Include="Sdcb.LibRaw.runtime.win64" Version="0.21.1.7" />
+    <PackageReference Include="Sdcb.LibRaw.runtime.win64" Version="0.21.1" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- SharpGen (Vortice) builds callback vtbls via reflection over static
+         fields (IL2067/IL2072). Our only such callback is WIC's ComStreamProxy
+         (RAW preview decode from memory) - rooting keeps those fields from
+         being trimmed: deterministic instead of "probably fine". -->
+    <TrimmerRootAssembly Include="SharpGen.Runtime" />
+    <TrimmerRootAssembly Include="SharpGen.Runtime.COM" />
   </ItemGroup>
 
   <ItemGroup>

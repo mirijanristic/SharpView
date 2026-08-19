@@ -8,28 +8,29 @@ internal static class Program
     [STAThread]
     static int Main(string[] args)
     {
-        // Must run before ANY window or dialog is created
-        // (applies HighDpiMode + visual styles from the .csproj).
-        ApplicationConfiguration.Initialize();
+        // Per-Monitor V2 DPI: primarily declared in app.manifest; this call is a
+        // harmless fallback and must run before ANY window or dialog is created.
+        NativeMethods.EnablePerMonitorDpiV2();
 
         try
         {
             if (HasFlag(args, "--register"))
             {
                 FileAssociations.Register();
-                MessageBox.Show(
+                NativeMethods.MessageBox(IntPtr.Zero,
                     "SharpView is now registered for image files.\n\n" +
                     "To make it the default viewer: right-click an image → " +
                     "Open with → Choose another app → SharpView → \"Always\".",
-                    "SharpView", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                    "SharpView", NativeMethods.MB_OK | NativeMethods.MB_ICONINFORMATION);
                 return 0;
             }
 
             if (HasFlag(args, "--unregister"))
             {
                 FileAssociations.Unregister();
-                MessageBox.Show("SharpView file associations removed.",
-                    "SharpView", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                NativeMethods.MessageBox(IntPtr.Zero,
+                    "SharpView file associations removed.",
+                    "SharpView", NativeMethods.MB_OK | NativeMethods.MB_ICONINFORMATION);
                 return 0;
             }
 
@@ -43,13 +44,11 @@ internal static class Program
                 if (ImageDecoder.SupportsRaw)
                     exts += ";" + string.Join(';', ImageDecoder.RawExtensions.Select(e => "*" + e));
 
-                using var ofd = new OpenFileDialog
-                {
-                    Title = "Select an image to view",
-                    Filter = $"Image Files|{exts}|All Files|*.*",
-                };
-                if (ofd.ShowDialog() != DialogResult.OK) return 0;
-                imagePath = ofd.FileName;
+                // Win32 filter format: display/pattern pairs separated by '\0'.
+                imagePath = NativeMethods.ShowOpenFileDialog(
+                    "Select an image to view",
+                    $"Image Files\0{exts}\0All Files\0*.*\0");
+                if (imagePath is null) return 0; // cancelled
             }
 
             using var app = new ViewerApp(imagePath);
@@ -58,8 +57,8 @@ internal static class Program
         }
         catch (Exception ex)
         {
-            MessageBox.Show(ex.ToString(), "SharpView — Fatal Error",
-                MessageBoxButtons.OK, MessageBoxIcon.Error);
+            NativeMethods.MessageBox(IntPtr.Zero, ex.ToString(),
+                "SharpView — Fatal Error", NativeMethods.MB_OK | NativeMethods.MB_ICONERROR);
             return 1;
         }
     }

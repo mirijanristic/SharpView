@@ -3,21 +3,17 @@ using SharpView.Platform;
 using SharpView.Rendering;
 using SharpView.Services;
 
-using Color = System.Drawing.Color;
-using Point = System.Drawing.Point;
-using Size = System.Drawing.Size;
-
 namespace SharpView;
 
 /// <summary>
-/// Main application class. Creates the form, manages input, and runs the render loop.
-/// The loop is demand-driven: when nothing is animating, loading, or being dragged,
-/// it sleeps briefly instead of redrawing a static image, so idle CPU/GPU usage
-/// drops to (near) zero.
+/// Main application class. Creates the Win32 window, manages input, and runs the
+/// render loop. The loop is demand-driven: when nothing is animating, loading, or
+/// being dragged, it sleeps briefly instead of redrawing a static image, so idle
+/// CPU/GPU usage drops to (near) zero.
 /// </summary>
 sealed class ViewerApp : IDisposable
 {
-    readonly ViewerForm _form;
+    readonly ViewerWindow _window;
     int _width, _height;
 
     readonly Core.DeviceResources _res = new();
@@ -29,7 +25,7 @@ sealed class ViewerApp : IDisposable
 
     bool _running = true, _needsResize;
     bool _dragging;
-    Point _lastMouse;
+    int _lastMouseX, _lastMouseY;
 
     // High-resolution frame timing (DateTime.UtcNow is low-resolution and slower).
     readonly Stopwatch _clock = Stopwatch.StartNew();
@@ -50,50 +46,35 @@ sealed class ViewerApp : IDisposable
         _initialImagePath = imagePath;
 
         // The window opens borderless-maximized, so its client area will be the
-        // FULL bounds of the screen it lands on. CenterScreen with no owner picks
-        // the screen containing the cursor (WinForms' CenterToScreen rule) — using
-        // the same rule here sizes the swap chain correctly before the window even
-        // exists, which turns the post-Show HandleResize into a no-op instead of a
-        // swap chain rebuild behind a full GPU wait. A wrong guess (cursor moved
-        // to another monitor mid-startup) simply falls back to a real resize.
-        var screenBounds = Screen.FromPoint(Cursor.Position).Bounds;
-        _width = screenBounds.Width;
-        _height = screenBounds.Height;
+        // FULL bounds of the screen it lands on. Windows maximizes a caption-less
+        // window over the whole monitor containing it — creating it centered on
+        // the cursor's monitor therefore sizes the swap chain correctly before
+        // the window is even shown, which turns the post-Show HandleResize into a
+        // no-op instead of a swap chain rebuild behind a full GPU wait. A wrong
+        // guess (cursor moved to another monitor mid-startup) simply falls back
+        // to a real resize.
+        var screen = NativeMethods.MonitorBoundsFromCursor();
+        _width = screen.Width;
+        _height = screen.Height;
 
-        _form = new ViewerForm
-        {
-            Text = $"SharpView — {Path.GetFileName(imagePath)}",
-            // Borderless overlay, Picasa-style: the whole screen is the viewer and
-            // the desktop stays visible through the translucent backdrop. Esc or
-            // Alt+F4 closes. Prefer a normal framed window again? Delete this line
-            // (it is set before ClientSize on purpose, so ClientSize is preserved).
-            FormBorderStyle = FormBorderStyle.None,
-            ClientSize = new Size(1400, 900), // restored (un-maximized) size
-            StartPosition = FormStartPosition.CenterScreen,
-            WindowState = FormWindowState.Maximized, // start full screen
-            BackColor = Color.FromArgb(18, 18, 18), // never visible (no GDI surface); kept for a framed fallback
-            KeyPreview = true,
-        };
+        // Restored (un-maximized) bounds: 1400×900 centered on that monitor —
+        // this is where drag-restore from maximized lands, exactly like before.
+        const int restoredW = 1400, restoredH = 900;
+        int x = screen.Left + Math.Max(0, (screen.Width - restoredW) / 2);
+        int y = screen.Top + Math.Max(0, (screen.Height - restoredH) / 2);
 
-        // Title-bar / Alt-Tab icon: reuse the icon embedded into the EXE via
-        // <ApplicationIcon>app.ico</ApplicationIcon> in the .csproj, so app.ico
-        // does not need to ship next to the executable.
-        try { _form.Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath); }
-        catch { /* missing/odd icon resource — keep the default form icon */ }
+        _window = new ViewerWindow(
+            $"SharpView — {Path.GetFileName(imagePath)}", x, y, restoredW, restoredH);
 
-        // The old WinForms "1:1" button is gone on purpose: WS_EX_NOREDIRECTIONBITMAP
-        // removes the window's GDI surface, so a classic child control would be
-        // invisible yet still swallow clicks. 1:1 stays available on double-click
-        // and the '1' key ('0' returns to fit).
-
-        _form.Resize += (_, _) => { _needsResize = true; Wake(); };
-        _form.FormClosing += (_, _) => _running = false;
-        _form.MouseWheel += OnMouseWheel;
-        _form.MouseDown += OnMouseDown;
-        _form.MouseUp += OnMouseUp;
-        _form.MouseMove += OnMouseMove;
-        _form.MouseDoubleClick += OnMouseDoubleClick;
-        _form.KeyHandler = HandleKey;
+        _window.Resized += () => { _needsResize = true; Wake(); };
+        _window.CloseRequested += () => _running = false;
+        _window.MouseWheel = OnMouseWheel;
+        _window.MouseDown = OnMouseDown;
+        _window.MouseUp = OnMouseUp;
+        _window.MouseMove = OnMouseMove;
+        _window.MouseDoubleClick = OnMouseDoubleClick;
+        _window.CaptureLost = EndDragIfActive; // Alt-Tab mid-pan must not leave a stuck drag
+        _window.KeyHandler = HandleKey;
 
         InitGraphics();
     }
@@ -107,8 +88,8 @@ sealed class ViewerApp : IDisposable
         _imageRenderer = new ImageRenderer(_res);
         _imageRenderer.LoadImageAsync(_initialImagePath);
 
-        _res.Init(_form.Handle, _width, _height);
-        WindowStyling.ApplyDarkStyle(_form.Handle); // no-op while borderless; kept for a framed fallback
+        _res.Init(_window.Handle, _width, _height);
+        WindowStyling.ApplyDarkStyle(_window.Handle); // no-op while borderless; kept for a framed fallback
 
         _thumbCache = new ThumbnailCache(_res);
         _thumbStrip = new ThumbnailStrip(_res, _thumbCache);
@@ -118,16 +99,16 @@ sealed class ViewerApp : IDisposable
         // move loop for it (drag-restore from maximized, Aero Snap, dragging to
         // the other monitor, double-click restore, right-click system menu). Only
         // the X stays client area so our own mouse handler gets the click.
-        _form.HitTestHandler = (x, y) =>
-            _topBar.HitTest(x, y, _width, _form.WindowState == FormWindowState.Maximized) switch
+        _window.HitTestHandler = (x, y) =>
+            _topBar.HitTest(x, y, _width, _window.IsMaximized) switch
             {
-                TopBar.Hit.Close => ViewerForm.HTClient,
-                TopBar.Hit.Drag => ViewerForm.HTCaption,
+                TopBar.Hit.Close => NativeMethods.HTClient,
+                TopBar.Hit.Drag => NativeMethods.HTCaption,
                 _ => 0,
             };
-        // Caption-zone mouse moves arrive as non-client messages, not MouseMove —
+        // Caption-zone mouse moves arrive as non-client messages, not WM_MOUSEMOVE —
         // wake the loop so the bar's hover logic (in Update) gets frames to run.
-        _form.NonClientMouseMove = Wake;
+        _window.NonClientMouseMove = Wake;
 
         _nav.ScanFolder(_initialImagePath);
         PrefetchNeighbors(); // next/prev are pre-decoded before the user asks
@@ -144,7 +125,7 @@ sealed class ViewerApp : IDisposable
 
     public void Run()
     {
-        _form.Show();
+        _window.ShowMaximized();
 
         // The swap chain was already created at the predicted maximized size, so
         // in the normal case this is a pure verification — DeviceResources skips
@@ -157,9 +138,11 @@ sealed class ViewerApp : IDisposable
 
         _lastFrameTime = _clock.Elapsed.TotalSeconds;
 
-        while (_running && _form.Visible)
+        while (_running)
         {
-            Application.DoEvents();
+            // Drain pending window messages (the DoEvents replacement); false
+            // means WM_QUIT arrived and the window is gone.
+            if (!_window.PumpMessages()) break;
             if (!_running) break;
 
             if (_needsResize)
@@ -173,7 +156,7 @@ sealed class ViewerApp : IDisposable
             {
                 // Fully idle: static image on screen, nothing decoding or animating.
                 // Sleep briefly instead of spinning at vsync — input is still polled
-                // every few milliseconds by DoEvents above.
+                // every few milliseconds by the message pump above.
                 Thread.Sleep(4);
                 _lastFrameTime = _clock.Elapsed.TotalSeconds;
                 continue;
@@ -229,23 +212,21 @@ sealed class ViewerApp : IDisposable
             // The initial decode failed (corrupt/unsupported file). Report once and
             // keep running — the rest of the folder stays browsable via the strip.
             _initialFailureReported = true;
-            MessageBox.Show(_form,
+            NativeMethods.MessageBox(_window.Handle,
                 $"Cannot open image:\n{_initialImagePath}",
-                "SharpView", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                "SharpView", NativeMethods.MB_OK | NativeMethods.MB_ICONWARNING);
         }
 
         _imageRenderer.Update(dt, _width, MainViewHeight);
         _thumbStrip.Update(dt, _width, _height, _nav);
 
         // Hover top bar: polled rather than event-driven, because its caption zone
-        // produces no client MouseMove and the mouse can leave the window sideways
-        // (toward the other monitor) without any message at all. Hidden while
-        // dragging so the bar stays out of the way of a pan near the top edge.
-        var cursor = _form.PointToClient(Cursor.Position);
-        bool cursorAvailable = !_dragging && _form.ContainsFocus
-                               && _form.ClientRectangle.Contains(cursor);
-        _topBar.Update(dt, _width, cursor.X, cursor.Y, cursorAvailable,
-            _form.WindowState == FormWindowState.Maximized);
+        // produces no client WM_MOUSEMOVE and the mouse can leave the window
+        // sideways (toward the other monitor) without any message at all. Hidden
+        // while dragging so the bar stays out of the way of a pan near the top edge.
+        _window.GetCursorClientPosition(out int cx, out int cy, out bool insideClient);
+        bool cursorAvailable = !_dragging && _window.IsForeground && insideClient;
+        _topBar.Update(dt, _width, cx, cy, cursorAvailable, _window.IsMaximized);
     }
 
     void RenderFrame()
@@ -278,7 +259,7 @@ sealed class ViewerApp : IDisposable
 
     void HandleResize()
     {
-        int w = _form.ClientSize.Width, h = _form.ClientSize.Height;
+        _window.GetClientSize(out int w, out int h);
         if (w <= 0 || h <= 0) return;
 
         _res.Resize(w, h);
@@ -305,37 +286,36 @@ sealed class ViewerApp : IDisposable
     }
 
     void UpdateTitle()
-        => _form.Text = $"SharpView - {Path.GetFileName(_nav.CurrentFile)}  [{_nav.CurrentIndex + 1}/{_nav.Count}]"
-                        + (_res.IsWarp ? "  [software rendering]" : "");
+        => _window.SetTitle(
+            $"SharpView - {Path.GetFileName(_nav.CurrentFile)}  [{_nav.CurrentIndex + 1}/{_nav.Count}]"
+            + (_res.IsWarp ? "  [software rendering]" : ""));
 
-    // ─── Input Handlers ───────────────────────────────────────────────
+    // ─── Input Handlers (client pixels; left button only by construction) ──
 
-    void OnMouseWheel(object? s, MouseEventArgs e)
+    void OnMouseWheel(int x, int y, int delta)
     {
-        // Only zoom while the cursor is over the main image area (which now spans
+        // Only zoom while the cursor is over the main image area (which spans
         // from the very top, so window Y and viewport Y are the same thing).
-        if (InMainView(e.Y))
+        if (InMainView(y))
         {
-            _imageRenderer.ZoomAt(e.Delta, e.X, e.Y, _width, MainViewHeight);
+            _imageRenderer.ZoomAt(delta, x, y, _width, MainViewHeight);
             Wake();
         }
     }
 
-    void OnMouseDown(object? s, MouseEventArgs e)
+    void OnMouseDown(int x, int y)
     {
-        if (e.Button != MouseButtons.Left) return;
-
         // The top bar's X? (Checked first — the bar overlays everything. The rest
         // of the bar never gets here: it hit-tests as caption, so Windows turns
         // clicks there into a window drag.)
-        if (_topBar.HitTestClose(e.X, e.Y, _width))
+        if (_topBar.HitTestClose(x, y, _width))
         {
             _running = false;
             return;
         }
 
         // Click on the thumbnail strip?
-        int thumbIndex = _thumbStrip.HitTest(e.X, e.Y, _width, _height, _nav.Count);
+        int thumbIndex = _thumbStrip.HitTest(x, y, _width, _height, _nav.Count);
         if (thumbIndex >= 0)
         {
             if (_nav.MoveTo(thumbIndex))
@@ -344,43 +324,46 @@ sealed class ViewerApp : IDisposable
         }
 
         // Otherwise start dragging the main image.
-        if (InMainView(e.Y))
+        if (InMainView(y))
         {
             _dragging = true;
-            _lastMouse = e.Location;
-            _form.Cursor = Cursors.SizeAll;
+            _lastMouseX = x;
+            _lastMouseY = y;
+            _window.SetDragCursor(true);
             Wake();
         }
     }
 
-    void OnMouseUp(object? s, MouseEventArgs e)
+    void OnMouseUp(int x, int y) => EndDragIfActive();
+
+    /// <summary>Ends a pan drag; also invoked when mouse capture is lost (Alt-Tab).</summary>
+    void EndDragIfActive()
     {
-        if (e.Button == MouseButtons.Left)
-        {
-            _dragging = false;
-            _form.Cursor = Cursors.Default;
-            Wake();
-        }
+        if (!_dragging) return;
+        _dragging = false;
+        _window.SetDragCursor(false);
+        Wake();
     }
 
-    void OnMouseMove(object? s, MouseEventArgs e)
+    void OnMouseMove(int x, int y)
     {
         if (!_dragging)
         {
             // Near the top edge? Give the bar's hover logic a frame to run (its
             // trigger zone is mostly caption, but the X area is client — and this
             // also catches re-entry from just below the bar).
-            if (e.Y < TopBar.BarHeight) Wake();
+            if (y < TopBar.BarHeight) Wake();
             return;
         }
-        float dx = e.X - _lastMouse.X, dy = e.Y - _lastMouse.Y;
+        float dx = x - _lastMouseX, dy = y - _lastMouseY;
         _imageRenderer.Pan(dx, dy);
-        _lastMouse = e.Location;
+        _lastMouseX = x;
+        _lastMouseY = y;
     }
 
-    void OnMouseDoubleClick(object? s, MouseEventArgs e)
+    void OnMouseDoubleClick(int x, int y)
     {
-        if (e.Button != MouseButtons.Left || !InMainView(e.Y)) return;
+        if (!InMainView(y)) return;
 
         if (!_imageRenderer.IsOneToOne)
             _imageRenderer.SetOneToOne();
@@ -389,48 +372,48 @@ sealed class ViewerApp : IDisposable
         Wake();
     }
 
-    bool HandleKey(Keys keyData)
+    bool HandleKey(int vk)
     {
-        bool handled = HandleKeyCore(keyData);
+        bool handled = HandleKeyCore(vk);
         if (handled) Wake();
         return handled;
     }
 
-    bool HandleKeyCore(Keys keyData)
+    bool HandleKeyCore(int vk)
     {
-        switch (keyData & Keys.KeyCode) // strip Shift/Ctrl/Alt modifiers
+        switch (vk)
         {
-            case Keys.Left:
+            case NativeMethods.VK_LEFT:
                 if (_nav.MovePrevious()) NavigateToImage();
                 return true;
-            case Keys.Right:
+            case NativeMethods.VK_RIGHT:
                 if (_nav.MoveNext()) NavigateToImage();
                 return true;
-            case Keys.Home:
+            case NativeMethods.VK_HOME:
                 if (_nav.MoveFirst()) NavigateToImage();
                 return true;
-            case Keys.End:
+            case NativeMethods.VK_END:
                 if (_nav.MoveLast()) NavigateToImage();
                 return true;
 
-            case Keys.D0 or Keys.NumPad0:
+            case NativeMethods.VK_0 or NativeMethods.VK_NUMPAD0:
                 _imageRenderer.FitToWindow(_width, MainViewHeight);
                 return true;
-            case Keys.D1 or Keys.NumPad1:
+            case NativeMethods.VK_1 or NativeMethods.VK_NUMPAD1:
                 _imageRenderer.SetOneToOne();
                 return true;
-            case Keys.Add or Keys.Oemplus:
+            case NativeMethods.VK_ADD or NativeMethods.VK_OEM_PLUS:
                 _imageRenderer.ZoomIn();
                 return true;
-            case Keys.Subtract or Keys.OemMinus:
+            case NativeMethods.VK_SUBTRACT or NativeMethods.VK_OEM_MINUS:
                 _imageRenderer.ZoomOut();
                 return true;
-            case Keys.Escape:
+            case NativeMethods.VK_ESCAPE:
                 _running = false;
                 return true;
 
             default:
-                return false; // let the system handle it (Alt+F4, Tab, ...)
+                return false; // let the system handle it (Alt+F4, ...)
         }
     }
 
@@ -442,6 +425,6 @@ sealed class ViewerApp : IDisposable
         _thumbCache?.Dispose();
         _imageRenderer?.Dispose();
         _res.Dispose();
-        _form.Dispose();
+        _window.Dispose();
     }
 }

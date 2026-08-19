@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Drawing;
 using System.Drawing.Imaging;
 using System.Runtime.CompilerServices;
 
@@ -193,7 +194,7 @@ static unsafe class ImageDecoder
                 g.DrawImage(original, 0, 0, nw, nh);
             }
         }
-        else if (!CanLockAs32bpp(original.PixelFormat))
+        else if (!CanLockAs32Bpp(original.PixelFormat))
         {
             // Exotic source formats (indexed, 16bpp, CMYK, ...) — normalize with one copy.
             bmp = new Bitmap(original);
@@ -242,7 +243,7 @@ static unsafe class ImageDecoder
     }
 
     /// <summary>Formats GDI+ can convert to 32bppArgb directly inside LockBits.</summary>
-    static bool CanLockAs32bpp(GdiPixelFormat format) => format
+    private static bool CanLockAs32Bpp(GdiPixelFormat format) => format
         is GdiPixelFormat.Format32bppArgb
         or GdiPixelFormat.Format32bppPArgb
         or GdiPixelFormat.Format32bppRgb

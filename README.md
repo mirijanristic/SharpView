@@ -1,6 +1,6 @@
 # SharpView
 
-**GPU-akcelerisani preglednik slika za Windows — Direct3D 12 + .NET 10 (WinForms host)**
+**GPU-akcelerisani preglednik slika za Windows — Direct3D 12 + .NET 10 (čisti Win32 host, bez UI frameworka)**
 
 ## O projektu
 
@@ -20,10 +20,11 @@ podređene tome.
 
 Potrebno: Windows 10/11 (x64), .NET 10 SDK, GPU sa D3D12 podrškom
 (feature level 12_0). Zavisnosti su Vortice.Windows paketi (Direct3D12, DXGI,
-D3DCompiler, Direct2D1 - u njemu žive WIC omotači) i
-`Sdcb.LibRaw.runtime.win64` (LibRaw native binarke za RAW formate — `raw_r.dll`
-i prateće dll-ove build sam kopira pored exe-a), sve se povlači sa NuGet-a.
-Build očekuje `app.ico` pored `SharpView.csproj`.
+D3DCompiler, Direct2D1 - u njemu žive WIC omotači), `System.Drawing.Common`
+(GDI+ fallback dekoder) i `Sdcb.LibRaw.runtime.win64` (LibRaw native binarke
+za RAW formate — `raw_r.dll` i prateće dll-ove build sam kopira pored exe-a),
+sve se povlači sa NuGet-a. Build očekuje `app.ico` i `app.manifest` pored
+`SharpView.csproj`.
 
     dotnet build -c Release
     dotnet run --project src/SharpView -c Release -- put/do/slike.jpg
@@ -36,6 +37,21 @@ Bez argumenta se otvara dijalog za izbor slike. Registracija u Explorerov
 
 Napomena: registracija pamti apsolutnu putanju exe-a - poslije premještanja
 aplikacije ponovo pokrenuti.
+
+### Native AOT publish
+
+Distribuciona binarka se pravi Native AOT kompajliranjem — jedan nativni exe,
+bez JIT-a i bez potrebe za instaliranim .NET runtime-om, sa trenutnim startom:
+
+    dotnet publish src/SharpView -c Release -r win-x64
+
+Izlaz: `src/SharpView/bin/Release/net10.0-windows/win-x64/publish/` —
+`SharpView.exe` plus LibRaw native dll-ovi. Za publish je potreban MSVC linker
+(Visual Studio ili Build Tools sa **"Desktop development with C++"**
+workload-om); obična `dotnet build` / F5 petlja i dalje radi na CoreCLR-u i ne
+traži ništa od toga — AOT se dešava isključivo pri publish-u. `app.manifest`
+(PerMonitorV2 DPI), ikonica i version info se ugrađuju i u AOT exe. Prvi
+publish je spor (kompajlira se i runtime); naredni su brži.
 
 ## Kontrole
 
@@ -69,8 +85,9 @@ kod fajlova od više stotina megabajta.
     │   ├── Services/    ImageDecoder (RAW + WIC + GDI+ fallback), WicDecoder, RawDecoder,
     │   │                LibRawNative, TiffOrientation, PixelOrientation,
     │   │                ImageNavigator, ThumbnailCache
-    │   ├── Platform/    FileAssociations (HKCU registry), WindowStyling (DWM stilizacija)
-    │   └── ViewerApp.cs / ViewerForm.cs / Program.cs
+    │   ├── Platform/    FileAssociations (HKCU registry), WindowStyling (DWM stilizacija),
+    │   │                NativeMethods (Win32 interop: prozor, poruke, dijalozi)
+    │   └── ViewerApp.cs / ViewerWindow.cs / Program.cs / app.manifest
     └── tests/SharpView.Tests/    unit testovi (ZoomPanController, ImageNavigator,
                                   TiffOrientation, PixelOrientation)
 
@@ -79,6 +96,14 @@ UI pravougaonici (pozadina stripa, okvir selekcije) crtaju se istim
 pipeline-om, a `TintColor.a` bira teksturni ili solid mod. `ZoomPanController`
 je čista matematika bez GPU/UI zavisnosti, pa je u potpunosti pokriven unit
 testovima.
+
+Ljuska prozora je čisti Win32: `ViewerWindow` registruje window klasu i vodi
+vlastiti WndProc preko `UnmanagedCallersOnly` function pointera, a render
+petlja sama prazni message queue (`PeekMessage`) umjesto WinForms
+`DoEvents`-a. Nema UI frameworka između aplikacije i sistema — dijalozi su
+`MessageBoxW` i `GetOpenFileNameW`, DPI (PerMonitorV2) dolazi iz
+`app.manifest`-a. Cijeli interop (i Win32 i LibRaw) je `[LibraryImport]` bez
+runtime marshalinga, pa je ljuska spremna za Native AOT.
 
 Tok jednog frejma: `Update` (animacije + konstante) → `BeginFrame` → uploadi
 tekstura snimljeni u frejmovu command listu → draw glavne slike → draw stripa →
