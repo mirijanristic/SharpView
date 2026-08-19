@@ -22,8 +22,12 @@ namespace SharpView;
 /// <remarks>
 /// Differences from WinForms worth knowing: mouse capture during drags is taken
 /// explicitly (WinForms did it implicitly), the drag cursor is applied in
-/// WM_SETCURSOR via <see cref="SetDragCursor"/>, and a lost capture (Alt-Tab
-/// mid-drag) surfaces as <see cref="CaptureLost"/> so the app can end the pan.
+/// WM_SETCURSOR via <see cref="SetDragCursor"/>, a lost capture (Alt-Tab
+/// mid-drag) surfaces as <see cref="CaptureLost"/> so the app can end the pan,
+/// and drag-restore from maximized (grab the bar → window un-maximizes and
+/// follows the mouse) is implemented manually in the WM_NCLBUTTONDOWN /
+/// mouse-move handlers — the system move loop refuses to move a maximized
+/// window and, for a borderless one, never performs the restore by itself.
 /// Single-window design on purpose: the WndProc reaches the instance through a
 /// static field, no GWLP_USERDATA bookkeeping needed.
 /// </remarks>
@@ -36,6 +40,11 @@ sealed unsafe class ViewerWindow : IDisposable
     IntPtr _hwnd;
     IntPtr _icon;
     bool _dragCursor;
+
+    // Armed by a caption press while maximized; fires (restore + hand the window
+    // to the native move loop) once the cursor passes the system drag threshold.
+    bool _pendingDragRestore;
+    NativeMethods.POINT _dragRestoreStart;
 
     public IntPtr Handle => _hwnd;
 
@@ -220,8 +229,29 @@ sealed unsafe class ViewerWindow : IDisposable
             }
 
             case NativeMethods.WM_NCMOUSEMOVE:
+                if (_pendingDragRestore && TryStartDragRestore()) return 0;
                 NonClientMouseMove?.Invoke();
                 break;
+
+            case NativeMethods.WM_NCLBUTTONDOWN:
+                // Maximized + caption: arm the WinForms-style drag-restore and
+                // swallow the message. Passing it to DefWindowProc would start a
+                // move loop that refuses to move a maximized window — the exact
+                // regression this fixes. A plain click therefore does nothing
+                // (as before), and the restore fires only after real movement,
+                // so double-click keeps toggling maximize/restore untouched.
+                if ((int)wParam == NativeMethods.HTCaption && NativeMethods.IsZoomed(hwnd))
+                {
+                    NativeMethods.GetCursorPos(out _dragRestoreStart);
+                    _pendingDragRestore = true;
+                    return 0;
+                }
+                break; // restored window: DefWindowProc runs the native move loop
+
+            case NativeMethods.WM_NCLBUTTONUP:
+            case NativeMethods.WM_NCLBUTTONDBLCLK:
+                _pendingDragRestore = false;
+                break; // dblclk → DefWindowProc toggles maximize/restore (unchanged)
 
             case NativeMethods.WM_KEYDOWN:
                 if (KeyHandler?.Invoke((int)wParam) == true) return 0;
@@ -244,6 +274,9 @@ sealed unsafe class ViewerWindow : IDisposable
                 return 0;
 
             case NativeMethods.WM_MOUSEMOVE:
+                // A fast caption drag can cross into the client area before the
+                // threshold trips — the pending restore must still fire.
+                if (_pendingDragRestore && TryStartDragRestore()) return 0;
                 MouseMove?.Invoke(LoWordX(lParam), HiWordY(lParam));
                 return 0;
 
@@ -305,6 +338,78 @@ sealed unsafe class ViewerWindow : IDisposable
 
         return NativeMethods.DefWindowProc(hwnd, msg, wParam, lParam);
     }
+
+    // ─── Drag-restore from maximized ───────────────────────────────────
+
+    /// <summary>
+    /// Completes an armed drag-restore once the cursor moves past the system
+    /// drag threshold with the button still held: restores the window with the
+    /// cursor kept proportionally over the bar (what Windows itself does for
+    /// framed windows), then hands the now-restored window to the native move
+    /// loop so it sticks to the mouse — from there on, Aero Snap, cross-monitor
+    /// drags and drag-to-top re-maximize all behave natively again.
+    /// </summary>
+    bool TryStartDragRestore()
+    {
+        if (NativeMethods.GetKeyState(NativeMethods.VK_LBUTTON) >= 0)
+        {
+            _pendingDragRestore = false; // released without dragging → plain click
+            return false;
+        }
+
+        NativeMethods.GetCursorPos(out var pt);
+        int thresholdX = Math.Max(NativeMethods.GetSystemMetrics(NativeMethods.SM_CXDRAG), 2);
+        int thresholdY = Math.Max(NativeMethods.GetSystemMetrics(NativeMethods.SM_CYDRAG), 2);
+        if (Math.Abs(pt.X - _dragRestoreStart.X) <= thresholdX
+            && Math.Abs(pt.Y - _dragRestoreStart.Y) <= thresholdY)
+        {
+            return false; // still within click slop — keep waiting
+        }
+
+        _pendingDragRestore = false;
+        RestoreForDrag(pt);
+
+        // Re-send the caption press: the window is no longer maximized, so this
+        // time it falls through to DefWindowProc's move loop (modal until drop).
+        NativeMethods.SendMessage(_hwnd, NativeMethods.WM_NCLBUTTONDOWN,
+            NativeMethods.HTCaption, PackXY(pt.X, pt.Y));
+        return true;
+    }
+
+    void RestoreForDrag(NativeMethods.POINT cursor)
+    {
+        NativeMethods.GetWindowRect(_hwnd, out var windowRect);
+
+        // Restored size from the placement; only the SIZE is used, so the
+        // workspace-vs-screen coordinate mismatch of NormalPosition is moot.
+        var placement = new NativeMethods.WINDOWPLACEMENT
+        {
+            Length = (uint)sizeof(NativeMethods.WINDOWPLACEMENT),
+        };
+        NativeMethods.GetWindowPlacement(_hwnd, ref placement);
+        int restoredW = placement.NormalPosition.Width;
+        int restoredH = placement.NormalPosition.Height;
+        if (restoredW < 200 || restoredH < 200) { restoredW = 1400; restoredH = 900; }
+
+        // Cursor stays at the same PROPORTION of the bar horizontally and the
+        // same offset from the top — the grab point remains under the finger.
+        double fractionX = windowRect.Width > 0
+            ? Math.Clamp((cursor.X - windowRect.Left) / (double)windowRect.Width, 0.0, 1.0)
+            : 0.5;
+        int offsetY = Math.Clamp(cursor.Y - windowRect.Top, 0, 64);
+
+        int x = cursor.X - (int)(restoredW * fractionX);
+        int y = cursor.Y - offsetY;
+
+        NativeMethods.ShowWindow(_hwnd, NativeMethods.SW_RESTORE);
+        NativeMethods.SetWindowPos(_hwnd, IntPtr.Zero, x, y, restoredW, restoredH,
+            NativeMethods.SWP_NOZORDER | NativeMethods.SWP_NOACTIVATE);
+    }
+
+    /// <summary>Screen point → lParam packing (signed shorts survive multi-monitor
+    /// coordinates left of / above the primary).</summary>
+    static nint PackXY(int x, int y)
+        => unchecked((nint)(uint)(((y & 0xFFFF) << 16) | (x & 0xFFFF)));
 
     public void Dispose()
     {

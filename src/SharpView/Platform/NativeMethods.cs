@@ -22,6 +22,9 @@ internal static unsafe partial class NativeMethods
     public const uint WM_SETICON = 0x0080;
     public const uint WM_NCHITTEST = 0x0084;
     public const uint WM_NCMOUSEMOVE = 0x00A0;
+    public const uint WM_NCLBUTTONDOWN = 0x00A1;
+    public const uint WM_NCLBUTTONUP = 0x00A2;
+    public const uint WM_NCLBUTTONDBLCLK = 0x00A3;
     public const uint WM_KEYDOWN = 0x0100;
     public const uint WM_MOUSEMOVE = 0x0200;
     public const uint WM_LBUTTONDOWN = 0x0201;
@@ -59,6 +62,7 @@ internal static unsafe partial class NativeMethods
     // ─── ShowWindow / SetWindowPos ─────────────────────────────────────
 
     public const int SW_SHOWMAXIMIZED = 3;
+    public const int SW_RESTORE = 9;
     public const uint SWP_NOZORDER = 0x0004;
     public const uint SWP_NOACTIVATE = 0x0010;
 
@@ -69,8 +73,15 @@ internal static unsafe partial class NativeMethods
     public const int ICON_SMALL = 0;
     public const int ICON_BIG = 1;
 
+    // ─── System metrics (GetSystemMetrics indices) ─────────────────────
+
+    /// <summary>Drag threshold before a press counts as a drag (typ. 4 px).</summary>
+    public const int SM_CXDRAG = 68;
+    public const int SM_CYDRAG = 69;
+
     // ─── Virtual-key codes used by the viewer ──────────────────────────
 
+    public const int VK_LBUTTON = 0x01;
     public const int VK_ESCAPE = 0x1B;
     public const int VK_END = 0x23;
     public const int VK_HOME = 0x24;
@@ -131,6 +142,19 @@ internal static unsafe partial class NativeMethods
         public IntPtr lpszMenuName;
         public IntPtr lpszClassName;
         public IntPtr hIconSm;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct WINDOWPLACEMENT
+    {
+        public uint Length; // set to sizeof(WINDOWPLACEMENT) before Get/Set
+        public uint Flags;
+        public uint ShowCmd;
+        public POINT MinPosition;
+        public POINT MaxPosition;
+        // NOTE: workspace coordinates, not screen — only its SIZE is
+        // origin-independent, which is the only thing the drag-restore uses.
+        public RECT NormalPosition;
     }
 
     [StructLayout(LayoutKind.Sequential)]
@@ -221,6 +245,21 @@ internal static unsafe partial class NativeMethods
         int x, int y, int width, int height, uint flags);
 
     // ─── user32: state queries ─────────────────────────────────────────
+
+    [LibraryImport("user32", EntryPoint = "GetWindowRect")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static partial bool GetWindowRect(IntPtr hwnd, out RECT rect);
+
+    [LibraryImport("user32", EntryPoint = "GetWindowPlacement")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static partial bool GetWindowPlacement(IntPtr hwnd, ref WINDOWPLACEMENT placement);
+
+    [LibraryImport("user32", EntryPoint = "GetSystemMetrics")]
+    public static partial int GetSystemMetrics(int index);
+
+    /// <summary>High bit set → key is currently down.</summary>
+    [LibraryImport("user32", EntryPoint = "GetKeyState")]
+    public static partial short GetKeyState(int virtualKey);
 
     [LibraryImport("user32", EntryPoint = "GetClientRect")]
     [return: MarshalAs(UnmanagedType.Bool)]
