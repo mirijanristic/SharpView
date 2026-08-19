@@ -19,8 +19,10 @@ podređene tome.
 ## Brzi start
 
 Potrebno: Windows 10/11 (x64), .NET 10 SDK, GPU sa D3D12 podrškom
-(feature level 12_0). Zavisnosti su Vortice.Windows paketi (Direct3D12, DXGI,
-D3DCompiler, Direct2D1 - u njemu žive WIC omotači), `System.Drawing.Common`
+(feature level 11_0 — rade i stariji Kepler/Haswell/GCN 1.0; bez ijednog
+hardverskog D3D12 adaptera aplikacija pada na WARP softverski rasterizer, spor
+ali funkcionalan). Zavisnosti su Vortice.Windows paketi (Direct3D12, DXGI,
+D3DCompiler, DirectComposition, Direct2D1 - u njemu žive WIC omotači), `System.Drawing.Common`
 (GDI+ fallback dekoder) i `Sdcb.LibRaw.runtime.win64` (LibRaw native binarke
 za RAW formate — `raw_r.dll` i prateće dll-ove build sam kopira pored exe-a),
 sve se povlači sa NuGet-a. Build očekuje `app.ico` i `app.manifest` pored
@@ -66,11 +68,19 @@ publish je spor (kompajlira se i runtime); naredni su brži.
 | lijevi klik + povlačenje | pomjeranje slike |
 | dupli klik | 1:1 ↔ fit |
 | klik na thumbnail | skok na tu sliku |
+| hover uz gornju ivicu | naslovna traka: povlačenje prozora, X, desni klik = sistemski meni |
+| hover uz donju ivicu | traka thumbnailova (pojavi se i sama pri navigaciji, ~3 s) |
+| povlačenje ivice / ćoška | promjena veličine prozora |
 | Esc | izlaz |
 
-Pri startu je prozor maksimizovan, naslovna traka tamna (DWM immersive dark
-mode + Mica na Windows 11), a slika se prikazuje **1:1 ako u cijelosti staje u
-prozor, inače fit** — male slike se nikad ne razvlače nasilno. Ista politika
+Pri startu je prozor maksimizovan i potpuno bez klasičnog okvira — slika je
+prostrta preko cijele površine (na Windows 11 sa nativnim zaobljenim uglovima
+i DWM sjenkom), a sav UI su dva poluprovidna overlaya iste nijanse koja se
+sama sklanjaju: naslovna traka na vrhu i traka thumbnailova na dnu. Obje se
+pojave čim miš kroči na njihovu površinu (i kad prozor nije fokusiran),
+identičnom fade animacijom; traka thumbnailova se pokaže i sama pri navigaciji
+strelicama i stoji ~3 sekunde. Slika se prikazuje **1:1 ako u cijelosti staje
+u prozor, inače fit** — male slike se nikad ne razvlače nasilno. Ista politika
 važi i pri listanju. Prozor se pojavljuje odmah: prva slika se dekodira
 asinhrono, paralelno sa inicijalizacijom GPU-a, i iskače čim je gotova — bitno
 kod fajlova od više stotina megabajta.
@@ -81,19 +91,22 @@ kod fajlova od više stotina megabajta.
     ├── src/SharpView/
     │   ├── Core/        DeviceResources (uređaj, swap chain, PSO, fence, deferred release),
     │   │                Shaders, TextureUploader, Vertex, ViewConstants
-    │   ├── Rendering/   ImageRenderer (glavna slika + prefetch), ThumbnailStrip, ZoomPanController
+    │   ├── Rendering/   ImageRenderer (glavna slika + prefetch), ThumbnailStrip, TopBar,
+    │   │                ZoomPanController
     │   ├── Services/    ImageDecoder (RAW + WIC + GDI+ fallback), WicDecoder, RawDecoder,
-    │   │                LibRawNative, TiffOrientation, PixelOrientation,
+    │   │                LibRawNative, TiffOrientation, JpegOrientation, PixelOrientation,
     │   │                ImageNavigator, ThumbnailCache
     │   ├── Platform/    FileAssociations (HKCU registry), WindowStyling (DWM stilizacija),
     │   │                NativeMethods (Win32 interop: prozor, poruke, dijalozi)
     │   └── ViewerApp.cs / ViewerWindow.cs / Program.cs / app.manifest
     └── tests/SharpView.Tests/    unit testovi (ZoomPanController, ImageNavigator,
-                                  TiffOrientation, PixelOrientation)
+                                  TiffOrientation, JpegOrientation, PixelOrientation)
 
 Cijeli prikaz je jedan shader par i jedan quad: glavna slika, thumbnailovi i
-UI pravougaonici (pozadina stripa, okvir selekcije) crtaju se istim
-pipeline-om, a `TintColor.a` bira teksturni ili solid mod. `ZoomPanController`
+UI pravougaonici (pozadine traka, okvir selekcije) crtaju se istim
+pipeline-om: `TintColor.a` bira teksturni ili solid mod, a `Misc.x` je
+zajednički opacity množilac kojim obje trake blijede kao jedna ploha
+(teksture i solid boje zajedno). `ZoomPanController`
 je čista matematika bez GPU/UI zavisnosti, pa je u potpunosti pokriven unit
 testovima.
 
@@ -104,6 +117,19 @@ petlja sama prazni message queue (`PeekMessage`) umjesto WinForms
 `MessageBoxW` i `GetOpenFileNameW`, DPI (PerMonitorV2) dolazi iz
 `app.manifest`-a. Cijeli interop (i Win32 i LibRaw) je `[LibraryImport]` bez
 runtime marshalinga, pa je ljuska spremna za Native AOT.
+
+Prozor se ponaša kao pravi sistemski uprkos tome što okvira nema:
+`WS_THICKFRAME` (vidljivi okvir uklonjen u `WM_NCCALCSIZE`) donosi resize
+ivicama/ćoškovima sa nativnim kursorima, Snap Layouts na povlačenje ka vrhu,
+bočni snap i Win+strelice; drag-restore iz maksimizovanog stanja je
+implementiran ručno (borderless prozoru ga sistem ne daje). Interaktivni
+resize mišem je *frozen-geometry* gest: OS prozor se jednom parkira na
+maksimalni doseg gesta i više se ne mijenja do puštanja dugmeta — po pokretu
+miša mijenja se samo sadržaj (offset + prividna veličina u prevelikom baferu,
+prozor sam clip-uje), čime se DWM-ova dva asinhrona kanala (geometrija,
+sadržaj) svode na jedan i resize je bez treptaja po konstrukciji, jednako
+gladak za lijevu i desnu ivicu. Swap chain baferi su *sticky-max* (samo rastu),
+pa tranzicije gesta i maximize/restore nikad ne pogode `ResizeBuffers` procjep.
 
 Tok jednog frejma: `Update` (animacije + konstante) → `BeginFrame` → uploadi
 tekstura snimljeni u frejmovu command listu → draw glavne slike → draw stripa →
@@ -221,9 +247,10 @@ rješava preuzimanjem, portable ZIP ga nosi app-local).
 
 ## Napomena o razvoju
 
-Refaktor je rađen u paru sa AI asistentom: analiza postojećeg koda, 
+Refaktor je rađen u paru sa AI asistentom: analiza postojećeg koda,
 dizajn fence-based upravljanja GPU resursima, WIC dekoder,
-prefetch/promotion mehanika i dokumentacija.
+prefetch/promotion mehanika, čista Win32 ljuska i frozen-geometry resize,
+LibRaw RAW podrška, Native AOT / instaler / CI i dokumentacija.
 Sve izmjene su ručno pregledane, kompajlirane i testirane prije uključivanja;
 odgovornost za kod je u potpunosti moja.
 
