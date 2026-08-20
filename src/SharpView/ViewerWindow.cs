@@ -919,6 +919,20 @@ sealed unsafe class ViewerWindow : IDisposable
         _pendingDragRestore = false;
         RestoreForDrag(pt);
 
+        // The next SendMessage enters DefWindowProc's MODAL move loop, which
+        // blocks the app's render loop until the drop — the swap chain would
+        // keep showing the stale maximized frame (clipped to the now smaller
+        // window) for the entire drag. Render one synchronous frame at the
+        // restored client size FIRST: the LiveResize handler resizes the swap
+        // chain, re-fits the image to the new size, and does not return until
+        // the frame is complete — so the drag starts with correct pixels.
+        if (LiveResize is not null)
+        {
+            NativeMethods.GetClientRect(_hwnd, out var restoredClient);
+            if (restoredClient.Width > 0 && restoredClient.Height > 0)
+                LiveResize(restoredClient.Width, restoredClient.Height);
+        }
+
         // Re-send the caption press: the window is no longer maximized, so this
         // time it falls through to DefWindowProc's move loop (modal until drop).
         NativeMethods.SendMessage(_hwnd, NativeMethods.WM_NCLBUTTONDOWN,

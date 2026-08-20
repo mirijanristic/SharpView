@@ -379,9 +379,20 @@ sealed class ViewerApp : IDisposable
         _window.GetClientSize(out int w, out int h);
         if (w <= 0 || h <= 0) return;
 
+        bool sizeChanged = w != _width || h != _height;
+
         _res.Resize(w, h);
         _width = w;
         _height = h;
+
+        // The zoom controller holds an ABSOLUTE pixel scale, so a restore from
+        // maximized (caption double-click), a maximize, or a DPI move would
+        // otherwise leave the image at its old size in the new window. Re-fit
+        // to the new client size — instantly, so the picture lands with the
+        // window instead of lagging behind it. FitOrOneToOne keeps the app's
+        // policy: small images stay 1:1, only larger ones scale to fit.
+        if (sizeChanged)
+            _imageRenderer?.FitOrOneToOneInstant(_width, _height);
     }
 
     /// <summary>
@@ -414,6 +425,11 @@ sealed class ViewerApp : IDisposable
         _res.Resize(width, height);
         _width = width;
         _height = height;
+
+        // Keep the image glued to the changing window: re-fit to every tick's
+        // size (pure math, no decode). Instant on purpose — an animated fit
+        // would trail the edge being dragged.
+        _imageRenderer.FitOrOneToOneInstant(_width, _height);
 
         Update();
         RenderFrame();
@@ -473,6 +489,10 @@ sealed class ViewerApp : IDisposable
         _width = width;
         _height = height;
 
+        // Fit to the gesture's starting apparent size, so the very first
+        // offset frame already shows the image sized to the window.
+        _imageRenderer.FitOrOneToOneInstant(_width, _height);
+
         Update();
         RenderFrame();
         _res.WaitForGpu();
@@ -491,6 +511,13 @@ sealed class ViewerApp : IDisposable
         _viewOffsetY = offsetY;
         _width = width;
         _height = height;
+
+        // Re-fit to the apparent size on every tick, exactly like the launch
+        // entrance does: the zoom controller's absolute scale would otherwise
+        // keep the image at its pre-gesture size while the window shrinks or
+        // grows around it. Instant (SnapToTargets) so the picture tracks the
+        // dragged edge 1:1; small images stay 1:1 and are never stretched.
+        _imageRenderer.FitOrOneToOneInstant(_width, _height);
         Wake();
     }
 
@@ -511,6 +538,10 @@ sealed class ViewerApp : IDisposable
         _res.Resize(width, height); // no-op with sticky buffers (never shrinks)
         _width = width;
         _height = height;
+
+        // Final exact fit for the settled window size (mirrors the launch
+        // animation's completion branch).
+        _imageRenderer.FitOrOneToOneInstant(_width, _height);
 
         Update();
         RenderFrame();
