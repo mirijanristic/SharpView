@@ -26,6 +26,22 @@ sealed class ViewerApp : IDisposable
     bool _frozenResize;
     int _viewOffsetX, _viewOffsetY;
     const int CbSlotVeil = 42; // after ImageRenderer's underlay slot (41)
+
+    // ─── Launch animation: OURS, not DWM's ─────────────────────────────
+    // DWM's launch transition is suppressed at first show (it DEFERS window
+    // geometry changes and latches the first frame — the source of the
+    // half-strip / image-pop startup artifacts). Instead the OS window appears
+    // instantly in its final fullscreen geometry, and the ENTRANCE is drawn by
+    // us: the apparent content rect grows from LaunchStartScale to full,
+    // centered, over LaunchSeconds — pure rendering through the same
+    // offset/apparent-size machinery the frozen-geometry resize proved out.
+    // The geometry never changes during it, so every DWM rule that bit us
+    // (deferral, fullscreen suppression, frame latching) is moot by
+    // construction.
+    bool _launchAnimating = true;
+    double _launchStart = -1; // clock time of the first animated frame
+    const float LaunchSeconds = 0.22f;
+    const float LaunchStartScale = 0.90f;
     readonly ImageNavigator _nav = new();
     ImageRenderer _imageRenderer = null!;
     ThumbnailStrip _thumbStrip = null!;
@@ -226,7 +242,8 @@ sealed class ViewerApp : IDisposable
 
     /// <summary>True when something on screen can still change and a frame must be drawn.</summary>
     bool NeedsFrame() =>
-        _forcedFrames > 0
+        _launchAnimating
+        || _forcedFrames > 0
         || _dragging
         || _needsResize
         || !_imageRenderer.IsAnimationSettled
@@ -245,6 +262,8 @@ sealed class ViewerApp : IDisposable
         double now = _clock.Elapsed.TotalSeconds;
         float dt = Math.Clamp((float)(now - _lastFrameTime), 0.0001f, 0.1f);
         _lastFrameTime = now;
+
+        UpdateLaunchAnimation(now);
 
         // A newly decoded main image? Publish its dimensions and set the view:
         // 1:1 when it fits, fit-to-window when it is bigger. The very first image
@@ -330,9 +349,9 @@ sealed class ViewerApp : IDisposable
             }
         }
 
-        // Frozen resize: the clear left the whole buffer transparent; put the
-        // veil back over exactly the apparent window rect.
-        if (_frozenResize)
+        // Frozen resize AND the launch entrance: the clear left the whole
+        // buffer transparent; put the veil back over exactly the apparent rect.
+        if (_frozenResize || _launchAnimating)
             DrawFrozenVeil();
 
         // Main image over the FULL window — the strip band and the hover top
@@ -497,6 +516,66 @@ sealed class ViewerApp : IDisposable
         RenderFrame();
         _res.WaitForGpu();
         Wake();
+    }
+
+    /// <summary>
+    /// Per-frame step of the launch entrance. Shrinks the apparent content
+    /// rect (offset + _width/_height) toward the center by the eased inverse
+    /// of the progress; everything outside stays fully transparent (the veil
+    /// quad covers only the apparent rect), so the composition visibly grows
+    /// out of the desktop. On completion the true client size is restored and
+    /// the first image — if it landed mid-animation and was fitted to an
+    /// apparent size — is re-fitted to the final one.
+    /// </summary>
+    void UpdateLaunchAnimation(double now)
+    {
+        if (!_launchAnimating) return;
+
+        // A resize gesture within the first fraction of a second would fight
+        // over the same offset state — concede instantly, no half measures.
+        if (_frozenResize)
+        {
+            _launchAnimating = false;
+            return;
+        }
+
+        if (_launchStart < 0) _launchStart = now;
+        float progress = (float)((now - _launchStart) / LaunchSeconds);
+
+        if (progress >= 1f)
+        {
+            _launchAnimating = false;
+            _res.ClearTransparent = false;
+            _viewOffsetX = 0;
+            _viewOffsetY = 0;
+            HandleResize(); // true client size back into _width/_height
+            if (_firstImageShown)
+                _imageRenderer.FitOrOneToOneInstant(_width, _height);
+            return;
+        }
+
+        float eased = 1f - MathF.Pow(1f - progress, 3f); // ease-out cubic
+        float scale = LaunchStartScale + (1f - LaunchStartScale) * eased;
+
+        _window.GetClientSize(out int clientW, out int clientH);
+        int apparentW = Math.Max(1, (int)(clientW * scale));
+        int apparentH = Math.Max(1, (int)(clientH * scale));
+        _viewOffsetX = (clientW - apparentW) / 2;
+        _viewOffsetY = (clientH - apparentH) / 2;
+        _width = apparentW;
+        _height = apparentH;
+        _res.ClearTransparent = true; // outside the apparent rect = desktop
+
+        // The image must GROW with the frame, not sit at the size it was
+        // fitted to when it first landed: the zoom controller holds an
+        // absolute scale, so without this the picture stayed small through
+        // the whole entrance and snapped to full at the end. Re-fitting to
+        // the current apparent size every frame keeps it glued to the
+        // animation (pure math, no decode); the completion branch above does
+        // the final exact fit. Images shown 1:1 stay 1:1 by the same rule —
+        // small pictures should not stretch just because the frame grows.
+        if (_firstImageShown)
+            _imageRenderer.FitOrOneToOneInstant(_width, _height);
     }
 
     /// <summary>
