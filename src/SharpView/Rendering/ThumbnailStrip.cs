@@ -46,7 +46,7 @@ sealed class ThumbnailStrip
     float _targetOpacity;             // 0 or 1
     float _holdTimer = HoldSeconds;   // starts held: the strip shows itself at launch
     /// <summary>How long the strip stays up after a show trigger (navigation).</summary>
-    const float HoldSeconds = 3f;
+    const float HoldSeconds = 2f;
     /// <summary>True once opaque enough to interact with (same bar semantics).</summary>
     public bool IsStripVisible => _opacity > TopBar.VisibleThreshold;
 

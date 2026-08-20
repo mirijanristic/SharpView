@@ -17,6 +17,16 @@ internal static unsafe partial class NativeMethods
     public const uint WM_SIZE = 0x0005;
     public const uint WM_GETMINMAXINFO = 0x0024;
     public const uint WM_WINDOWPOSCHANGING = 0x0046;
+    public const uint WM_SYSCOMMAND = 0x0112;
+
+    // WM_SYSCOMMAND commands (low 4 bits are system-internal — mask with 0xFFF0).
+    public const uint SC_MINIMIZE = 0xF020;
+    public const uint SC_RESTORE = 0xF120;
+
+    /// <summary>Private message: re-enable DWM transitions right after the
+    /// first show (they are force-disabled around it — see
+    /// <see cref="DWMWA_TRANSITIONS_FORCEDISABLED"/>).</summary>
+    public const uint WM_APP_RESTORE_TRANSITIONS = 0x8000 + 2;
 
     /// <summary>Private message: re-assert the fullscreen-over-taskbar maximize
     /// AFTER the system's maximize transaction fully completes. Calling
@@ -435,6 +445,19 @@ internal static unsafe partial class NativeMethods
     /// this pins content and geometry into the same composition.</summary>
     [LibraryImport("dwmapi", EntryPoint = "DwmFlush")]
     public static partial int DwmFlush();
+
+    /// <summary>TRUE suppresses DWM window transitions (the launch zoom, and
+    /// minimize/restore animations while set). Used ONLY around the first show:
+    /// during the launch animation DWM defers geometry changes, so the
+    /// post-show fullscreen correction landed visually at animation end — the
+    /// image visibly widened and its bottom popped in. No animation → nothing
+    /// to defer behind → the window appears already final. The attribute is
+    /// restored immediately after, so every later transition animates normally.</summary>
+    public const uint DWMWA_TRANSITIONS_FORCEDISABLED = 3;
+
+    [LibraryImport("dwmapi", EntryPoint = "DwmSetWindowAttribute")]
+    public static partial int DwmSetWindowAttribute(IntPtr hwnd, uint attribute,
+        ref int value, uint size);
 
     // ─── kernel32 / shell32 ────────────────────────────────────────────
 

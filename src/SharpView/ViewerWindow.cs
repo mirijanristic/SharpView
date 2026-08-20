@@ -207,7 +207,28 @@ sealed unsafe class ViewerWindow : IDisposable
 
     // ─── Shell operations used by ViewerApp ────────────────────────────
 
-    public void ShowMaximized() => NativeMethods.ShowWindow(_hwnd, NativeMethods.SW_SHOWMAXIMIZED);
+    public void ShowMaximized()
+    {
+        // No launch transition, on purpose: during it DWM DEFERS window
+        // geometry changes, so the post-show fullscreen correction (work area →
+        // full monitor) landed visually only at animation end — the image
+        // popped wider and its bottom filled in, whatever we rendered
+        // underneath. With the transition suppressed the window simply appears,
+        // already final. The attribute is restored via a posted message the
+        // moment the show settles, so minimize/restore/maximize keep their
+        // animations. The caption strip stays too: single-step startup
+        // geometry (caption-less maximize natively targets the full monitor).
+        int disableTransitions = 1;
+        NativeMethods.DwmSetWindowAttribute(_hwnd,
+            NativeMethods.DWMWA_TRANSITIONS_FORCEDISABLED,
+            ref disableTransitions, sizeof(int));
+
+        SetMaximizedChrome(_hwnd, maximized: true);
+        NativeMethods.ShowWindow(_hwnd, NativeMethods.SW_SHOWMAXIMIZED);
+
+        NativeMethods.PostMessage(_hwnd,
+            NativeMethods.WM_APP_RESTORE_TRANSITIONS, 0, 0);
+    }
 
     public void SetTitle(string title) => NativeMethods.SetWindowText(_hwnd, title);
 
@@ -337,6 +358,28 @@ sealed unsafe class ViewerWindow : IDisposable
                     }
                 }
                 break; // DefWindowProc continues with the (possibly adjusted) pos
+            }
+
+            case NativeMethods.WM_SYSCOMMAND:
+            {
+                // Re-caption just before DefWindowProc takes the window OUT of
+                // the caption-less maximized state. Honest scope note: this
+                // does NOT animate leaving fullscreen — DWM suppresses
+                // transitions out of a monitor-covering window regardless of
+                // style (empirically verified; the accepted trade-off for
+                // over-taskbar maximize). What it DOES buy: the window carries
+                // its caption through the MINIMIZED state, so the later
+                // restore-from-minimize (window iconic, this hook idle) keeps
+                // its native animation. Landing in maximized again strips the
+                // caption via WM_SIZE as usual.
+                uint command = (uint)wParam & 0xFFF0;
+                if ((command == NativeMethods.SC_RESTORE
+                        || command == NativeMethods.SC_MINIMIZE)
+                    && NativeMethods.IsZoomed(hwnd))
+                {
+                    SetMaximizedChrome(hwnd, maximized: false);
+                }
+                break; // DefWindowProc carries out the command
             }
 
             case NativeMethods.WM_NCACTIVATE:
@@ -574,9 +617,9 @@ sealed unsafe class ViewerWindow : IDisposable
                     // So the caption comes off on entering maximized and back
                     // on when leaving (WM_SIZE 0 below); WM_NCCALCSIZE makes
                     // the two styles pixel-identical, and the restored state
-                    // keeps everything WS_CAPTION bought (minimize animation,
-                    // reliable taskbar toggling — the latter now independently
-                    // guaranteed by the Present(0)+DwmFlush pacing anyway).
+                    // keeps everything WS_CAPTION bought. (Leaving fullscreen
+                    // is NOT animated — DWM suppresses transitions out of
+                    // monitor-covering windows regardless of style; accepted.)
                     SetMaximizedChrome(hwnd, maximized: true);
                     NativeMethods.PostMessage(hwnd,
                         NativeMethods.WM_APP_ENFORCE_FULLSCREEN, 0, 0);
@@ -592,6 +635,15 @@ sealed unsafe class ViewerWindow : IDisposable
                     return 0;
                 Resized?.Invoke(); // normal path: maximize/restore/DPI, app loop running
                 break;
+
+            case NativeMethods.WM_APP_RESTORE_TRANSITIONS:
+            {
+                int enableTransitions = 0;
+                NativeMethods.DwmSetWindowAttribute(hwnd,
+                    NativeMethods.DWMWA_TRANSITIONS_FORCEDISABLED,
+                    ref enableTransitions, sizeof(int));
+                return 0;
+            }
 
             case NativeMethods.WM_APP_ENFORCE_FULLSCREEN:
                 if (NativeMethods.IsZoomed(hwnd))
