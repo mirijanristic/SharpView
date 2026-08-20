@@ -50,9 +50,27 @@ sealed class ThumbnailStrip
     /// <summary>True once opaque enough to interact with (same bar semantics).</summary>
     public bool IsStripVisible => _opacity > TopBar.VisibleThreshold;
 
-    /// <summary>True while the strip needs frames: fading, visible (cursor is
-    /// polled every frame to decide the fade-out), or holding after a trigger.</summary>
-    public bool WantsFrames => _opacity > 0f || _targetOpacity > 0f || _holdTimer > 0f;
+    /// <summary>True only while the strip is ANIMATING (fade in progress). A
+    /// steady visible strip deliberately does NOT request frames — see
+    /// <see cref="TopBar.WantsFrames"/> for why (a continuous Present loop over
+    /// a static scene blocked taskbar minimize/restore for the hold duration).
+    /// Idle-time bookkeeping lives in <see cref="Poll"/>; the scroll animation
+    /// is covered separately by <see cref="IsSettled"/>.</summary>
+    public bool WantsFrames => _opacity != _targetOpacity;
+
+    /// <summary>
+    /// Lightweight state tick for the IDLE loop: advances the hold timer and
+    /// re-evaluates the hover target WITHOUT animating or rendering. Returns
+    /// true when a fade must start (target moved away from current opacity).
+    /// </summary>
+    public bool Poll(float dt, int cursorY, bool cursorAvailable, int windowHeight)
+    {
+        if (_holdTimer > 0f) _holdTimer -= dt;
+        bool inZone = cursorAvailable
+            && cursorY >= windowHeight - ReservedHeight && cursorY < windowHeight;
+        _targetOpacity = inZone || _holdTimer > 0f ? 1f : 0f;
+        return _opacity != _targetOpacity;
+    }
 
     /// <summary>Show the strip now and keep it up for <see cref="HoldSeconds"/> —
     /// called on keyboard navigation so the strip narrates where you are.</summary>

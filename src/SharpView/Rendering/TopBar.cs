@@ -56,7 +56,28 @@ sealed class TopBar
     /// fade back out — that also covers the mouse leaving the window sideways
     /// (toward the other monitor), which produces no window message at all.
     /// </summary>
-    public bool WantsFrames => _opacity > 0f || _targetOpacity > 0f;
+    /// <summary>True only while the bar is ANIMATING (opacity moving toward its
+    /// target). A steady visible bar deliberately does NOT request frames: the
+    /// scene is static, and a continuous Present loop over a large window has
+    /// real costs — it kept the flip queue hot enough that taskbar
+    /// minimize/restore clicks were refused with the default beep for exactly
+    /// as long as an overlay was held visible. State bookkeeping while idle
+    /// (hold countdown, hover enter/leave) runs in <see cref="Poll"/>.</summary>
+    public bool WantsFrames => _opacity != _targetOpacity;
+
+    /// <summary>
+    /// Lightweight state tick for the IDLE loop: advances the startup hold and
+    /// re-evaluates the hover target WITHOUT animating or rendering anything.
+    /// Returns true when the target changed away from the current opacity —
+    /// i.e. a fade must start and the caller should render again.
+    /// </summary>
+    public bool Poll(float dt, int cursorY, bool cursorAvailable)
+    {
+        if (_startupHold > 0f) _startupHold -= dt;
+        bool inZone = cursorAvailable && cursorY >= 0 && cursorY < BarHeight;
+        _targetOpacity = inZone || _startupHold > 0f ? 1f : 0f;
+        return _opacity != _targetOpacity;
+    }
 
     /// <summary>
     /// Advance the fade animation. <paramref name="cursorX"/>/<paramref name="cursorY"/>

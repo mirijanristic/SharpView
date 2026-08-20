@@ -16,6 +16,13 @@ internal static unsafe partial class NativeMethods
     public const uint WM_DESTROY = 0x0002;
     public const uint WM_SIZE = 0x0005;
     public const uint WM_GETMINMAXINFO = 0x0024;
+    public const uint WM_WINDOWPOSCHANGING = 0x0046;
+
+    /// <summary>Private message: re-assert the fullscreen-over-taskbar maximize
+    /// AFTER the system's maximize transaction fully completes. Calling
+    /// SetWindowPos from inside WM_SIZE (i.e. mid-transaction) gets overridden
+    /// when the transaction finalizes — posting defers past it.</summary>
+    public const uint WM_APP_ENFORCE_FULLSCREEN = 0x8000 + 1;
     public const uint WM_NCCALCSIZE = 0x0083;
     public const uint WM_CLOSE = 0x0010;
     public const uint WM_QUIT = 0x0012;
@@ -23,6 +30,7 @@ internal static unsafe partial class NativeMethods
     public const uint WM_SETCURSOR = 0x0020;
     public const uint WM_SETICON = 0x0080;
     public const uint WM_NCHITTEST = 0x0084;
+    public const uint WM_NCACTIVATE = 0x0086;
     public const uint WM_NCMOUSEMOVE = 0x00A0;
     public const uint WM_NCLBUTTONDOWN = 0x00A1;
     public const uint WM_NCLBUTTONUP = 0x00A2;
@@ -59,6 +67,12 @@ internal static unsafe partial class NativeMethods
     // ─── Window styles ─────────────────────────────────────────────────
 
     public const uint WS_POPUP = 0x80000000;
+    /// <summary>The caption bit is REQUIRED even though no caption is ever drawn
+    /// (WM_NCCALCSIZE claims the whole window as client): DWM keys the native
+    /// minimize/restore animations on it, and the shell's taskbar-button toggle
+    /// misbehaves on caption-less windows (rapid clicks get refused with the
+    /// default beep). Windows Terminal ships the exact same recipe.</summary>
+    public const uint WS_CAPTION = 0x00C00000;
     public const uint WS_SYSMENU = 0x00080000;      // right-click system menu on the caption zone
     /// <summary>Marks the window resizable. Required twice over: for the edge/corner
     /// resize hit-test codes to enter the native resize loop, AND for the shell to
@@ -82,7 +96,13 @@ internal static unsafe partial class NativeMethods
 
     public const int SW_SHOWMAXIMIZED = 3;
     public const int SW_RESTORE = 9;
+    public const uint SWP_NOSIZE = 0x0001;
+    public const uint SWP_NOMOVE = 0x0002;
     public const uint SWP_NOZORDER = 0x0004;
+    /// <summary>Re-run WM_NCCALCSIZE and redraw the frame after a style change.</summary>
+    public const uint SWP_FRAMECHANGED = 0x0020;
+
+    public const int GWL_STYLE = -16;
     public const uint SWP_NOACTIVATE = 0x0010;
 
     // ─── Cursors / icons ───────────────────────────────────────────────
@@ -178,6 +198,18 @@ internal static unsafe partial class NativeMethods
         public IntPtr lpszMenuName;
         public IntPtr lpszClassName;
         public IntPtr hIconSm;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct WINDOWPOS
+    {
+        public IntPtr Hwnd;
+        public IntPtr HwndInsertAfter;
+        public int X;
+        public int Y;
+        public int Cx;
+        public int Cy;
+        public uint Flags;
     }
 
     [StructLayout(LayoutKind.Sequential)]
@@ -285,6 +317,16 @@ internal static unsafe partial class NativeMethods
     [LibraryImport("user32", EntryPoint = "SendMessageW")]
     public static partial nint SendMessage(IntPtr hwnd, uint msg, nint wParam, nint lParam);
 
+    [LibraryImport("user32", EntryPoint = "GetWindowLongPtrW")]
+    public static partial nint GetWindowLongPtr(IntPtr hwnd, int index);
+
+    [LibraryImport("user32", EntryPoint = "SetWindowLongPtrW")]
+    public static partial nint SetWindowLongPtr(IntPtr hwnd, int index, nint newValue);
+
+    [LibraryImport("user32", EntryPoint = "PostMessageW")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static partial bool PostMessage(IntPtr hwnd, uint msg, nint wParam, nint lParam);
+
     [LibraryImport("user32", EntryPoint = "SetWindowPos")]
     [return: MarshalAs(UnmanagedType.Bool)]
     public static partial bool SetWindowPos(IntPtr hwnd, IntPtr insertAfter,
@@ -314,6 +356,10 @@ internal static unsafe partial class NativeMethods
     [LibraryImport("user32", EntryPoint = "IsZoomed")]
     [return: MarshalAs(UnmanagedType.Bool)]
     public static partial bool IsZoomed(IntPtr hwnd);
+
+    [LibraryImport("user32", EntryPoint = "IsIconic")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static partial bool IsIconic(IntPtr hwnd);
 
     [LibraryImport("user32", EntryPoint = "GetForegroundWindow")]
     public static partial IntPtr GetForegroundWindow();

@@ -528,7 +528,15 @@ sealed unsafe class DeviceResources : IDisposable
 
         _cmdList.Close();
         CommandQueue.ExecuteCommandList(_cmdList);
-        SwapChain.Present(1, PresentFlags.None);
+        // Sync interval 0, deliberately: on a composition swap chain DWM
+        // composes at its own cadence anyway (no tearing is possible), while
+        // Present(1) would BLOCK this thread on vblank and let the flip queue
+        // saturate during continuous animation — the thread then lives inside
+        // Present instead of the message pump, which is exactly the state in
+        // which taskbar minimize/restore clicks were refused with the default
+        // beep. Frame pacing is the render loop's job now (DwmFlush on the
+        // compositor clock) — the Avalonia LowLatency pattern.
+        SwapChain.Present(0, PresentFlags.None);
 
         ulong fv = _currentFenceValue++;
         CommandQueue.Signal(_fence, fv);

@@ -82,6 +82,9 @@ sealed unsafe class ViewerWindow : IDisposable
     /// <summary>True while inside the system's modal move/size loop.</summary>
     public bool InSizeMove => _inSizeMove;
 
+    /// <summary>True while minimized — the render loop must not present then.</summary>
+    public bool IsMinimized => NativeMethods.IsIconic(_hwnd);
+
     /// <summary>Return true if the key (virtual-key code) was handled; false for
     /// default processing (Alt+F4, ...).</summary>
     public Func<int, bool>? KeyHandler;
@@ -173,9 +176,15 @@ sealed unsafe class ViewerWindow : IDisposable
         _hwnd = NativeMethods.CreateWindowEx(
             NativeMethods.WS_EX_NOREDIRECTIONBITMAP | NativeMethods.WS_EX_APPWINDOW,
             ClassName, title,
-            NativeMethods.WS_POPUP | NativeMethods.WS_SYSMENU
+            // Full standard window styles, Terminal-style: WM_NCCALCSIZE removes
+            // every visible trace of the frame AND the caption, but the style
+            // bits stay — WS_THICKFRAME buys resize + snappability, WS_CAPTION
+            // buys the native minimize/restore animations and a taskbar button
+            // that toggles reliably (caption-less windows get neither; rapid
+            // taskbar clicks used to be refused with the default beep).
+            NativeMethods.WS_POPUP | NativeMethods.WS_CAPTION | NativeMethods.WS_SYSMENU
                 | NativeMethods.WS_MINIMIZEBOX | NativeMethods.WS_MAXIMIZEBOX
-                | NativeMethods.WS_THICKFRAME // resizable + snappable; frame removed in WM_NCCALCSIZE
+                | NativeMethods.WS_THICKFRAME
                 | NativeMethods.WS_CLIPCHILDREN | NativeMethods.WS_CLIPSIBLINGS,
             x, y, width, height,
             IntPtr.Zero, IntPtr.Zero, instance, IntPtr.Zero);
@@ -317,6 +326,49 @@ sealed unsafe class ViewerWindow : IDisposable
     {
         switch (msg)
         {
+            case NativeMethods.WM_WINDOWPOSCHANGING:
+            {
+                // Fullscreen-over-taskbar maximize. With WS_CAPTION present the
+                // system maximizes to the WORK AREA (above the taskbar); this
+                // app's maximized state has always meant the WHOLE monitor. The
+                // WM_GETMINMAXINFO route is a multi-monitor minefield (its
+                // values are primary-monitor-relative with murky translation
+                // rules), so the geometry is forced HERE instead: every sized
+                // change applied while maximized is snapped to the full rect of
+                // the monitor the proposed geometry lands on. Deterministic,
+                // per-monitor correct, and it also makes the NCCALCSIZE clamp a
+                // pure identity (client == window == monitor — no offset warts).
+                if (NativeMethods.IsZoomed(hwnd) && !_frozenResize)
+                {
+                    var pos = (NativeMethods.WINDOWPOS*)lParam;
+                    if ((pos->Flags & NativeMethods.SWP_NOSIZE) == 0 && pos->Cx > 0 && pos->Cy > 0)
+                    {
+                        var center = new NativeMethods.POINT
+                        {
+                            X = pos->X + pos->Cx / 2,
+                            Y = pos->Y + pos->Cy / 2,
+                        };
+                        IntPtr monitor = NativeMethods.MonitorFromPoint(center, 2 /* NEAREST */);
+                        var info = new NativeMethods.MONITORINFO { cbSize = (uint)sizeof(NativeMethods.MONITORINFO) };
+                        if (monitor != IntPtr.Zero && NativeMethods.GetMonitorInfo(monitor, ref info))
+                        {
+                            pos->X = info.rcMonitor.Left;
+                            pos->Y = info.rcMonitor.Top;
+                            pos->Cx = info.rcMonitor.Width;
+                            pos->Cy = info.rcMonitor.Height;
+                        }
+                    }
+                }
+                break; // DefWindowProc continues with the (possibly adjusted) pos
+            }
+
+            case NativeMethods.WM_NCACTIVATE:
+                // With WS_CAPTION present, (de)activation would try to repaint a
+                // legacy caption that layout-wise does not exist. Passing -1 as
+                // lParam is the documented way to tell DefWindowProc to skip the
+                // non-client repaint entirely.
+                return NativeMethods.DefWindowProc(hwnd, msg, wParam, -1);
+
             case NativeMethods.WM_NCCALCSIZE when wParam != 0:
             {
                 // wParam TRUE: lParam points at NCCALCSIZE_PARAMS whose first
@@ -332,14 +384,42 @@ sealed unsafe class ViewerWindow : IDisposable
                 var rect = (NativeMethods.RECT*)lParam;
                 if (NativeMethods.IsZoomed(hwnd))
                 {
-                    IntPtr monitor = NativeMethods.MonitorFromWindow(hwnd, 2 /* NEAREST */);
+                    // The monitor MUST come from the PROPOSED rect, never from
+                    // the window's current position (MonitorFromWindow): during
+                    // a restore-from-minimize the window still sits at the
+                    // minimized parking spot (-32000) or mid-animation, so the
+                    // current position picks the WRONG monitor — and clamping a
+                    // right-monitor maximized rect against the left monitor's
+                    // bounds intersects to an EMPTY rect. A per-pixel
+                    // transparent window with an empty client is simply
+                    // invisible: rapid taskbar minimize/restore clicking used
+                    // to "lose" the window exactly this way.
+                    var center = new NativeMethods.POINT
+                    {
+                        X = (rect->Left + rect->Right) / 2,
+                        Y = (rect->Top + rect->Bottom) / 2,
+                    };
+                    IntPtr monitor = NativeMethods.MonitorFromPoint(center, 2 /* NEAREST */);
                     var info = new NativeMethods.MONITORINFO { cbSize = (uint)sizeof(NativeMethods.MONITORINFO) };
                     if (monitor != IntPtr.Zero && NativeMethods.GetMonitorInfo(monitor, ref info))
                     {
-                        rect->Left = Math.Max(rect->Left, info.rcMonitor.Left);
-                        rect->Top = Math.Max(rect->Top, info.rcMonitor.Top);
-                        rect->Right = Math.Min(rect->Right, info.rcMonitor.Right);
-                        rect->Bottom = Math.Min(rect->Bottom, info.rcMonitor.Bottom);
+                        int left = Math.Max(rect->Left, info.rcMonitor.Left);
+                        int top = Math.Max(rect->Top, info.rcMonitor.Top);
+                        int right = Math.Min(rect->Right, info.rcMonitor.Right);
+                        int bottom = Math.Min(rect->Bottom, info.rcMonitor.Bottom);
+
+                        // Belt and suspenders: the clamp may only ever SHRINK a
+                        // valid rect, never destroy it. If the intersection is
+                        // degenerate (transient geometry mid-animation), leave
+                        // the proposed rect untouched — an unclamped frame is
+                        // cosmetic, an empty client is an invisible window.
+                        if (right > left && bottom > top)
+                        {
+                            rect->Left = left;
+                            rect->Top = top;
+                            rect->Right = right;
+                            rect->Bottom = bottom;
+                        }
                     }
                 }
 
@@ -496,6 +576,38 @@ sealed unsafe class ViewerWindow : IDisposable
                 break;
 
             case NativeMethods.WM_SIZE:
+                // Fullscreen-over-taskbar maximize (wParam 2 = SIZE_MAXIMIZED):
+                // enforced via a POSTED message, because a SetWindowPos issued
+                // from inside WM_SIZE runs mid-maximize-transaction and the
+                // transaction's finalization overrides it (empirically: the
+                // window stayed at the work area). The post lands after the
+                // transaction completes; WM_WINDOWPOSCHANGING (IsZoomed true by
+                // then) keeps the result pinned against later adjustments.
+                // Placed BEFORE the size-move early-return so a drag-to-top
+                // snap-maximize is covered too.
+                if (wParam == 2)
+                {
+                    // Maximized = CAPTION-LESS. Both halves of the taskbar
+                    // problem key on the caption bit: the window manager
+                    // actively keeps a captioned maximized window at the WORK
+                    // AREA (both in-transaction and deferred SetWindowPos
+                    // attempts to the full monitor were reverted), and the
+                    // shell's fullscreen detection — which drops the taskbar
+                    // BELOW the window — only engages for caption-less windows.
+                    // So the caption comes off on entering maximized and back
+                    // on when leaving (WM_SIZE 0 below); WM_NCCALCSIZE makes
+                    // the two styles pixel-identical, and the restored state
+                    // keeps everything WS_CAPTION bought (minimize animation,
+                    // reliable taskbar toggling — the latter now independently
+                    // guaranteed by the Present(0)+DwmFlush pacing anyway).
+                    SetMaximizedChrome(hwnd, maximized: true);
+                    NativeMethods.PostMessage(hwnd,
+                        NativeMethods.WM_APP_ENFORCE_FULLSCREEN, 0, 0);
+                }
+                else if (wParam == 0)
+                {
+                    SetMaximizedChrome(hwnd, maximized: false);
+                }
                 // During an interactive resize the frame for this tick was
                 // already rendered in WM_NCCALCSIZE (before the move landed) —
                 // rendering again here would just add a stale-lag frame back.
@@ -503,6 +615,11 @@ sealed unsafe class ViewerWindow : IDisposable
                     return 0;
                 Resized?.Invoke(); // normal path: maximize/restore/DPI, app loop running
                 break;
+
+            case NativeMethods.WM_APP_ENFORCE_FULLSCREEN:
+                if (NativeMethods.IsZoomed(hwnd))
+                    EnsureFullscreenMaximized();
+                return 0;
 
             case NativeMethods.WM_EXITSIZEMOVE:
                 _inSizeMove = false;
@@ -539,6 +656,53 @@ sealed unsafe class ViewerWindow : IDisposable
         }
 
         return NativeMethods.DefWindowProc(hwnd, msg, wParam, lParam);
+    }
+
+    /// <summary>Toggles WS_CAPTION with the maximized state: off while
+    /// maximized (full-monitor coverage + shell fullscreen detection), on while
+    /// restored (native minimize animation). Visually a no-op — WM_NCCALCSIZE
+    /// claims the whole window as client in both styles.</summary>
+    static void SetMaximizedChrome(IntPtr hwnd, bool maximized)
+    {
+        nint style = NativeMethods.GetWindowLongPtr(hwnd, NativeMethods.GWL_STYLE);
+        bool hasCaption = (style & NativeMethods.WS_CAPTION) == NativeMethods.WS_CAPTION;
+        if (maximized != hasCaption) return; // already in the right chrome
+
+        nint newStyle = maximized
+            ? style & ~(nint)NativeMethods.WS_CAPTION
+            : style | (nint)NativeMethods.WS_CAPTION;
+        NativeMethods.SetWindowLongPtr(hwnd, NativeMethods.GWL_STYLE, newStyle);
+        NativeMethods.SetWindowPos(hwnd, IntPtr.Zero, 0, 0, 0, 0,
+            NativeMethods.SWP_FRAMECHANGED | NativeMethods.SWP_NOMOVE
+            | NativeMethods.SWP_NOSIZE | NativeMethods.SWP_NOZORDER
+            | NativeMethods.SWP_NOACTIVATE);
+    }
+
+    /// <summary>Snaps a maximized window to the FULL rect of its monitor (this
+    /// app's maximized state covers the taskbar). No-op when already there.</summary>
+    void EnsureFullscreenMaximized()
+    {
+        NativeMethods.GetWindowRect(_hwnd, out var rect);
+        var center = new NativeMethods.POINT
+        {
+            X = (rect.Left + rect.Right) / 2,
+            Y = (rect.Top + rect.Bottom) / 2,
+        };
+        IntPtr monitor = NativeMethods.MonitorFromPoint(center, 2 /* NEAREST */);
+        var info = new NativeMethods.MONITORINFO { cbSize = (uint)sizeof(NativeMethods.MONITORINFO) };
+        if (monitor == IntPtr.Zero || !NativeMethods.GetMonitorInfo(monitor, ref info))
+            return;
+
+        var target = info.rcMonitor;
+        if (rect.Left == target.Left && rect.Top == target.Top
+            && rect.Right == target.Right && rect.Bottom == target.Bottom)
+        {
+            return; // already fullscreen — the common case after the first snap
+        }
+
+        NativeMethods.SetWindowPos(_hwnd, IntPtr.Zero,
+            target.Left, target.Top, target.Width, target.Height,
+            NativeMethods.SWP_NOZORDER | NativeMethods.SWP_NOACTIVATE);
     }
 
     // ─── Frozen-geometry resize ────────────────────────────────────────

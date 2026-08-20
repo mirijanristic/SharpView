@@ -170,13 +170,44 @@ sealed class ViewerApp : IDisposable
                 Wake();
             }
 
-            if (!NeedsFrame())
+            // NEVER render while minimized, no matter what wants frames. On a
+            // flip-model swap chain Present(1) BLOCKS the thread until a prior
+            // frame is consumed — and a minimized window's composition visual
+            // stops being consumed by DWM, so the flip queue fills and every
+            // further present stalls. A stalled thread stops pumping messages,
+            // the shell's SC_RESTORE sits unprocessed, and rapid taskbar
+            // clicks were refused with the default beep until the queue
+            // drained (~a second). Nothing is visible anyway: park and pump.
+            // The Resized wake on restore resumes rendering immediately.
+            if (_window.IsMinimized)
             {
-                // Fully idle: static image on screen, nothing decoding or animating.
-                // Sleep briefly instead of spinning at vsync — input is still polled
-                // every few milliseconds by the message pump above.
                 Thread.Sleep(4);
                 _lastFrameTime = _clock.Elapsed.TotalSeconds;
+                continue;
+            }
+
+            if (!NeedsFrame())
+            {
+                // Fully idle: static image on screen, nothing decoding or
+                // animating — INCLUDING a steadily visible top bar or thumbnail
+                // strip (they only request frames while fading; a static
+                // overlay must not keep a Present loop alive). Their timers and
+                // hover state still have to tick, so poll them cheaply here; a
+                // poll reporting a change (hold expired, cursor entered/left a
+                // zone) skips the sleep and lets the next iteration render the
+                // fade. Input is still pumped every few milliseconds above.
+                double idleNow = _clock.Elapsed.TotalSeconds;
+                float idleDt = Math.Clamp((float)(idleNow - _lastFrameTime), 0.0001f, 0.1f);
+                _lastFrameTime = idleNow;
+
+                _window.GetCursorClientPosition(out _, out int pollY, out bool pollInside);
+                bool pollAvailable = !_dragging && pollInside;
+                bool overlayChanged =
+                    _thumbStrip.Poll(idleDt, pollY, pollAvailable, _height)
+                    | _topBar.Poll(idleDt, pollY, pollAvailable);
+                if (overlayChanged) continue; // a fade starts — render it
+
+                Thread.Sleep(4);
                 continue;
             }
 
@@ -184,6 +215,13 @@ sealed class ViewerApp : IDisposable
 
             Update();
             RenderFrame();
+
+            // Compositor-clock pacing (replaces the old Present(1) vsync
+            // block): one frame per DWM composition, presented with sync
+            // interval 0 so it never queues deep and never parks the thread
+            // inside Present. DwmFlush is where the waiting now happens — a
+            // plain blocking wait after which the loop returns to the pump.
+            NativeMethods.DwmFlush();
         }
     }
 
