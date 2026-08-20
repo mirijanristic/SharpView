@@ -123,11 +123,6 @@ sealed unsafe class ViewerWindow : IDisposable
     /// the window is destroyed in <see cref="Dispose"/>.</summary>
     public Action? CloseRequested;
 
-    /// <summary>The modal move/size loop ended — the app leaves live-resize mode
-    /// here, BEFORE the follow-up <see cref="Resized"/> does the final exact-size
-    /// pass.</summary>
-    public Action? SizeMoveEnded;
-
     /// <summary>Frozen resize began: (bufferW, bufferH, offsetX, offsetY,
     /// apparentW, apparentH). The handler must resize the swap chain to the
     /// buffer size, render one frame at the offset and not return until the
@@ -218,29 +213,11 @@ sealed unsafe class ViewerWindow : IDisposable
 
     public bool IsMaximized => NativeMethods.IsZoomed(_hwnd);
 
-    public bool IsForeground => NativeMethods.GetForegroundWindow() == _hwnd;
-
     public void GetClientSize(out int width, out int height)
     {
         NativeMethods.GetClientRect(_hwnd, out var rect);
         width = rect.Width;
         height = rect.Height;
-    }
-
-    /// <summary>Full pixel size of the monitor the window currently occupies —
-    /// the upper bound a single resize gesture can reach without changing
-    /// monitors (and buffer growth covers even that rare case).</summary>
-    public void GetMonitorSize(out int width, out int height)
-    {
-        IntPtr monitor = NativeMethods.MonitorFromWindow(_hwnd, 2 /* NEAREST */);
-        var info = new NativeMethods.MONITORINFO { cbSize = (uint)sizeof(NativeMethods.MONITORINFO) };
-        if (monitor != IntPtr.Zero && NativeMethods.GetMonitorInfo(monitor, ref info))
-        {
-            width = info.rcMonitor.Width;
-            height = info.rcMonitor.Height;
-            return;
-        }
-        GetClientSize(out width, out height);
     }
 
     /// <summary>Cursor position in client pixels + whether it is inside the client
@@ -623,7 +600,6 @@ sealed unsafe class ViewerWindow : IDisposable
 
             case NativeMethods.WM_EXITSIZEMOVE:
                 _inSizeMove = false;
-                SizeMoveEnded?.Invoke();
                 // Safety net after a native move/size loop: one regular resize
                 // pass through the app loop (same-size requests dedupe in
                 // DeviceResources anyway).

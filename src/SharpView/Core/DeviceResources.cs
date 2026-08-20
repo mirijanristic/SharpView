@@ -593,10 +593,6 @@ sealed unsafe class DeviceResources : IDisposable
     public void BeginLiveResize(int maxWidth, int maxHeight)
         => EnsureBufferCapacity(maxWidth, maxHeight);
 
-    /// <summary>Kept for call-site symmetry; with sticky buffers there is
-    /// nothing to undo at gesture end (no shrink — no ResizeBuffers flash).</summary>
-    public void EndLiveResize() { }
-
     /// <summary>Grow (never shrink) the buffers. Growth is rounded up to 256 px
     /// chunks: it should never trigger mid-gesture (capacity covers the virtual
     /// screen up front), but if it ever does — monitor topology changing under a

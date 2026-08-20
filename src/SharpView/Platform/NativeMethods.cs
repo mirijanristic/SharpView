@@ -361,9 +361,6 @@ internal static unsafe partial class NativeMethods
     [return: MarshalAs(UnmanagedType.Bool)]
     public static partial bool IsIconic(IntPtr hwnd);
 
-    [LibraryImport("user32", EntryPoint = "GetForegroundWindow")]
-    public static partial IntPtr GetForegroundWindow();
-
     // ─── user32: mouse, cursor, capture ────────────────────────────────
 
     [LibraryImport("user32", EntryPoint = "GetCursorPos")]
@@ -391,9 +388,6 @@ internal static unsafe partial class NativeMethods
 
     [LibraryImport("user32", EntryPoint = "MonitorFromPoint")]
     public static partial IntPtr MonitorFromPoint(POINT point, uint flags); // 2 = MONITOR_DEFAULTTONEAREST
-
-    [LibraryImport("user32", EntryPoint = "MonitorFromWindow")]
-    public static partial IntPtr MonitorFromWindow(IntPtr hwnd, uint flags); // 2 = MONITOR_DEFAULTTONEAREST
 
     [LibraryImport("user32", EntryPoint = "GetMonitorInfoW")]
     [return: MarshalAs(UnmanagedType.Bool)]
@@ -441,16 +435,6 @@ internal static unsafe partial class NativeMethods
     /// this pins content and geometry into the same composition.</summary>
     [LibraryImport("dwmapi", EntryPoint = "DwmFlush")]
     public static partial int DwmFlush();
-
-    /// <summary>DWM attributes toggled around the frozen-resize gesture: the
-    /// window is parked at the gesture's maximal bounds, and Win11 must not
-    /// paint chrome (shadow/border/rounded corners) around that parked rect.</summary>
-    public const uint DWMWA_NCRENDERING_POLICY = 2;        // 0 = use style, 1 = disabled
-    public const uint DWMWA_WINDOW_CORNER_PREFERENCE = 33; // 0 = default, 1 = do not round
-
-    [LibraryImport("dwmapi", EntryPoint = "DwmSetWindowAttribute")]
-    public static partial int DwmSetWindowAttribute(IntPtr hwnd, uint attribute,
-        ref int value, uint size);
 
     // ─── kernel32 / shell32 ────────────────────────────────────────────
 

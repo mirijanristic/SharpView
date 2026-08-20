@@ -77,7 +77,6 @@ sealed class ViewerApp : IDisposable
 
         _window.Resized += () => { _needsResize = true; Wake(); };
         _window.LiveResize = OnLiveResize;
-        _window.SizeMoveEnded = () => _res.EndLiveResize();
         _window.FrozenResizeBegin = OnFrozenResizeBegin;
         _window.FrozenResizeTick = OnFrozenResizeTick;
         _window.FrozenResizeEnd = OnFrozenResizeEnd;
