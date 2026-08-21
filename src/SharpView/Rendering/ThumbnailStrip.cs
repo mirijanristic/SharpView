@@ -22,11 +22,9 @@ sealed class ThumbnailStrip
     /// margin — the band background makes it a solid bar, so lifting it above
     /// the see-through taskbar zone no longer serves a purpose).</summary>
     public const int StripHeight = ThumbSize + ThumbPadding * 2;
-    /// <summary>Kept for call sites; the band is flush with the bottom edge.</summary>
-    public const int BottomMargin = 0;
     /// <summary>Total vertical space reserved at the bottom —
     /// the image input zone ends above this (the image itself draws under it).</summary>
-    public const int ReservedHeight = StripHeight + BottomMargin;
+    public const int ReservedHeight = StripHeight;
     const int CellWidth = 65;       // cell width including padding
     const int BorderWidth = 2;
 
@@ -146,8 +144,8 @@ sealed class ThumbnailStrip
         if (!nav.HasFiles) return;
         if (_opacity <= 0.004f) return; // fully faded out — draw nothing
 
-        // Top of the strip band [stripY, stripY + StripHeight]; the BottomMargin
-        // below it stays empty so the strip clears the see-through taskbar area.
+        // Top of the strip band [stripY, stripY + StripHeight] — the band sits
+        // flush with the bottom window edge.
         float stripY = windowHeight - ReservedHeight;
 
         // Band background: the image is laid out over the full window and runs
@@ -283,7 +281,7 @@ sealed class ThumbnailStrip
         // Faded out = nothing visible, nothing clickable (hovering the zone
         // fades the strip in first, so real clicks always land on a visible one).
         if (!IsStripVisible) return -1;
-        // The whole reserved bottom band counts, including the empty margin below
+        // The whole reserved bottom band counts, including the padding below
         // the thumbnails — a slightly-too-low click still selects (forgiving target).
         float stripY = windowHeight - ReservedHeight;
         if (screenY < stripY || screenY > windowHeight) return -1;

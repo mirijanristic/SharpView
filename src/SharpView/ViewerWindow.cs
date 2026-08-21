@@ -171,9 +171,10 @@ sealed unsafe class ViewerWindow : IDisposable
         _hwnd = NativeMethods.CreateWindowEx(
             NativeMethods.WS_EX_NOREDIRECTIONBITMAP | NativeMethods.WS_EX_APPWINDOW,
             ClassName, title,
-            // Full standard window styles, Terminal-style: WM_NCCALCSIZE removes
-            // every visible trace of the frame AND the caption, but the style
-            // bits stay — WS_THICKFRAME buys resize + snappability, WS_CAPTION
+            // WS_POPUP base carrying the full decorated-window style bits,
+            // Terminal-style recipe: WM_NCCALCSIZE removes every visible trace
+            // of the frame AND the caption, but the bits themselves stay —
+            // WS_THICKFRAME buys resize + snappability, WS_CAPTION
             // buys the native minimize/restore animations and a taskbar button
             // that toggles reliably (caption-less windows get neither; rapid
             // taskbar clicks used to be refused with the default beep).

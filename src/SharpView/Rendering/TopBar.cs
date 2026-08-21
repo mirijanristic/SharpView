@@ -50,12 +50,6 @@ sealed class TopBar
     /// <summary>True once the bar is opaque enough for the X to be interactive.</summary>
     public bool IsVisible => _opacity > VisibleThreshold;
 
-    /// <summary>
-    /// True while the bar needs frames: fading in/out, or fully visible. While
-    /// visible, <see cref="Update"/> polls the cursor every frame to decide when to
-    /// fade back out — that also covers the mouse leaving the window sideways
-    /// (toward the other monitor), which produces no window message at all.
-    /// </summary>
     /// <summary>True only while the bar is ANIMATING (opacity moving toward its
     /// target). A steady visible bar deliberately does NOT request frames: the
     /// scene is static, and a continuous Present loop over a large window has
@@ -84,11 +78,9 @@ sealed class TopBar
     /// are client pixels; <paramref name="cursorAvailable"/> should be false when the
     /// cursor is outside the client area, the app is not focused, or an image drag is
     /// in progress (the bar stays out of the way while panning).
-    /// <paramref name="windowMaximized"/> is passed fresh on every call because it can
-    /// flip mid-drag (drag-restore) while the render loop is blocked.
     /// </summary>
     public void Update(float dt, int windowWidth, int cursorX, int cursorY,
-                       bool cursorAvailable, bool windowMaximized)
+                       bool cursorAvailable)
     {
         if (_startupHold > 0f) _startupHold -= dt;
 
@@ -113,10 +105,8 @@ sealed class TopBar
         && y >= 0 && y < BarHeight
         && x >= windowWidth - CloseWidth && x < windowWidth;
 
-    /// <summary>Semantic hit test for WM_NCHITTEST (window drag vs. close click).
-    /// The parameter is kept for signature stability at the call site; the zone
-    /// no longer depends on it.</summary>
-    public Hit HitTest(int x, int y, int windowWidth, bool windowMaximized)
+    /// <summary>Semantic hit test for WM_NCHITTEST (window drag vs. close click).</summary>
+    public Hit HitTest(int x, int y, int windowWidth)
     {
         if (y < 0 || y >= BarHeight || x < 0 || x >= windowWidth) return Hit.None;
         return HitTestClose(x, y, windowWidth) ? Hit.Close : Hit.Drag;

@@ -129,7 +129,7 @@ sealed class ViewerApp : IDisposable
         // the other monitor, double-click restore, right-click system menu). Only
         // the X stays client area so our own mouse handler gets the click.
         _window.HitTestHandler = (x, y) =>
-            _topBar.HitTest(x, y, _width, _window.IsMaximized) switch
+            _topBar.HitTest(x, y, _width) switch
             {
                 TopBar.Hit.Close => NativeMethods.HTClient,
                 TopBar.Hit.Drag => NativeMethods.HTCaption,
@@ -306,7 +306,7 @@ sealed class ViewerApp : IDisposable
 
         _imageRenderer.Update(dt, _width, _height);
         _thumbStrip.Update(dt, _width, _height, cy, cursorAvailable, _nav);
-        _topBar.Update(dt, _width, cx, cy, cursorAvailable, _window.IsMaximized);
+        _topBar.Update(dt, _width, cx, cy, cursorAvailable);
     }
 
     void RenderFrame()
@@ -416,8 +416,9 @@ sealed class ViewerApp : IDisposable
         // any single monitor, and a too-small buffer would fall back to a full
         // reallocation on every tick — the expensive-tick regime whose flicker
         // this whole mechanism exists to kill (plus the camouflage band would
-        // vanish). Memory is transient: released with the first resize after
-        // the gesture ends.
+        // vanish). The capacity persists afterwards: buffers are sticky-max
+        // (DeviceResources.Resize never shrinks), which is exactly what keeps
+        // later geometry transitions flashless — see the policy note there.
         int reachW = Math.Max(NativeMethods.GetSystemMetrics(NativeMethods.SM_CXVIRTUALSCREEN), width);
         int reachH = Math.Max(NativeMethods.GetSystemMetrics(NativeMethods.SM_CYVIRTUALSCREEN), height);
         _res.BeginLiveResize(reachW, reachH);

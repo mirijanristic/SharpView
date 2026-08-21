@@ -56,8 +56,6 @@ static partial class LibRawNative
     // ─── Error codes we branch on (libraw_const.h, enum LibRaw_errors) ─────────
 
     public const int Success = 0;
-    public const int NoThumbnail = -5;          // LIBRAW_NO_THUMBNAIL
-    public const int UnsupportedThumbnail = -6; // LIBRAW_UNSUPPORTED_THUMBNAIL
 
     // ─── libraw_processed_image_t (libraw_types.h) ─────────────────────────────
 

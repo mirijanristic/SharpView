@@ -191,8 +191,13 @@ sealed class ThumbnailCache : IDisposable
     {
         _cts.Cancel();
         _cts.Dispose();
-        _cts = new CancellationTokenSource();
+        _cts = new CancellationTokenSource(); // cache stays usable after a Clear
 
+        DrainAndRelease();
+    }
+
+    void DrainAndRelease()
+    {
         while (_pendingQueue.TryDequeue(out _)) { }
 
         lock (_lock)
@@ -212,8 +217,11 @@ sealed class ThumbnailCache : IDisposable
 
     public void Dispose()
     {
-        Clear();
+        // Same teardown as Clear, minus the CTS recreation — nothing may use
+        // the cache after Dispose, so replacing the token source would only
+        // allocate one to destroy it on the next line.
         _cts.Cancel();
         _cts.Dispose();
+        DrainAndRelease();
     }
 }
