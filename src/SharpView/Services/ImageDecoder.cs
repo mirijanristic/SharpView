@@ -79,6 +79,84 @@ static unsafe class ImageDecoder
         return GdiDecodeToBgra(path, out width, out height, maxDimension, lowQuality);
     }
 
+    /// <summary>Provides the destination for a decode: given the final pixel
+    /// dimensions, returns a writable BGRA buffer pointer and its row pitch
+    /// (≥ width×4; total capacity RowPitch × height). May be invoked AGAIN if a
+    /// codec fails mid-decode and the fallback chain retries — each invocation
+    /// supersedes the previous destination, which the provider should release.</summary>
+    public delegate (IntPtr Destination, uint RowPitch) BgraDestinationProvider(int width, int height);
+
+    /// <summary>
+    /// Decode an image file DIRECTLY into caller-provided memory (typically a
+    /// mapped GPU upload heap) instead of a managed byte[]. The WIC path writes
+    /// straight from the format converter — no intermediate array exists at
+    /// all; the RAW and GDI+ fallbacks still decode to a temp array (orientation
+    /// transforms and LockBits need readable memory, and the destination is
+    /// write-combined) and copy once, on THIS thread. Full resolution only —
+    /// the main-image path never scales.
+    /// </summary>
+    public static void DecodeToBgraDestination(string path, BgraDestinationProvider getDestination,
+                                               out int width, out int height)
+    {
+        if (IsRawFile(path))
+        {
+            try
+            {
+                byte[] raw = RawDecoder.DecodeToBgra(path, out width, out height, 0, false);
+                var (rawDst, rawPitch) = getDestination(width, height);
+                CopyRowsTo(raw, width, height, rawDst, rawPitch);
+                return;
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"[ImageDecoder] LibRaw failed for '{path}', falling back: {ex.Message}");
+            }
+        }
+
+        if (WicDecoder.IsAvailable)
+        {
+            try
+            {
+                WicDecoder.DecodeToBgraDestination(path, getDestination, out width, out height);
+                return;
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"[ImageDecoder] WIC failed for '{path}', falling back to GDI+: {ex.Message}");
+            }
+        }
+
+        byte[] pixels = GdiDecodeToBgra(path, out width, out height, 0, false);
+        var (gdiDst, gdiPitch) = getDestination(width, height);
+        CopyRowsTo(pixels, width, height, gdiDst, gdiPitch);
+    }
+
+    /// <summary>Row-copy tightly packed BGRA into pitched destination memory —
+    /// sequential writes only, matching a write-combined upload heap.</summary>
+    static void CopyRowsTo(byte[] pixels, int width, int height,
+                           IntPtr destination, uint rowPitch)
+    {
+        int tightPitch = width * 4;
+        fixed (byte* src = pixels)
+        {
+            byte* dst = (byte*)destination;
+            if (rowPitch == (uint)tightPitch)
+            {
+                Unsafe.CopyBlock(dst, src, (uint)(tightPitch * height));
+            }
+            else
+            {
+                for (int y = 0; y < height; y++)
+                {
+                    Unsafe.CopyBlock(
+                        dst + y * (long)rowPitch,
+                        src + y * (long)tightPitch,
+                        (uint)tightPitch);
+                }
+            }
+        }
+    }
+
     /// <summary>
     /// Decode an image straight into an exactly <paramref name="size"/>×<paramref name="size"/>
     /// center-cropped ("cover") BGRA square — the thumbnail path. WIC decodes with

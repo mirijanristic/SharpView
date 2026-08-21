@@ -102,6 +102,35 @@ static class WicDecoder
     }
 
     /// <summary>
+    /// Decode a file's first frame at FULL resolution directly into
+    /// caller-provided memory: once the header is parsed, the callback supplies
+    /// the destination (pointer + row pitch, capacity RowPitch × height) and
+    /// the format converter's CopyPixels writes every row straight into it.
+    /// With a mapped GPU upload heap as the destination, the decode IS the
+    /// upload fill — no intermediate managed array exists. WIC writes rows
+    /// sequentially, which is exactly the access pattern write-combined upload
+    /// memory wants.
+    /// </summary>
+    public static void DecodeToBgraDestination(string path,
+        ImageDecoder.BgraDestinationProvider getDestination, out int width, out int height)
+    {
+        using var factory = new IWICImagingFactory();
+        using var decoder = factory.CreateDecoderFromFileName(
+            path, FileAccess.Read, DecodeOptions.CacheOnDemand);
+        using var frame = decoder.GetFrame(0);
+
+        var size = frame.Size;
+        using var converter = factory.CreateFormatConverter();
+        converter.Initialize(frame, WicPixelFormat.Format32bppBGRA,
+            BitmapDitherType.None, null, 0.0, BitmapPaletteType.Custom);
+
+        width = size.Width;
+        height = size.Height;
+        var (destination, rowPitch) = getDestination(width, height);
+        converter.CopyPixels(rowPitch, (uint)((long)rowPitch * height), destination);
+    }
+
+    /// <summary>
     /// Reads the pixel dimensions of an in-memory image without decoding any
     /// pixels (header parse only). Used to size-gate RAW previews cheaply.
     /// </summary>

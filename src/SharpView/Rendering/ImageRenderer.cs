@@ -9,14 +9,16 @@ namespace SharpView.Rendering;
 
 /// <summary>
 /// Renders the main image view with zoom, pan, and smooth animation.
-/// Image decode happens on a background thread; the GPU upload is recorded directly
-/// into the frame's command list, so navigation never blocks on the GPU.
-/// A small bounded GPU-RESIDENT prefetch cache keeps the neighboring images as
-/// ready textures (decoded AND uploaded), so next/previous navigation is a pure
-/// SRV-slot swap — no decode, no upload. Pixels exist on the CPU only while in
-/// transit (decode → upload queue → texture), which removes the half-gigabyte of
-/// LOH byte[] the old CPU-side cache pinned. On UMA (integrated) GPUs the textures
-/// still occupy system RAM, but outside the managed heap — no GC pressure.
+/// Image decode happens on a background thread STRAIGHT INTO a mapped GPU upload
+/// buffer (the WIC path writes rows directly from the format converter — no
+/// intermediate managed array exists at all; RAW/GDI+ do one worker-side copy).
+/// The render thread only ever records the GPU copy — microseconds per frame,
+/// so navigation never hitches on uploads. A small bounded GPU-RESIDENT prefetch
+/// cache keeps the neighboring images as ready textures, so next/previous
+/// navigation is a pure SRV-slot swap. Pixels exist in CPU-visible memory only
+/// while in transit, which removes the half-gigabyte of LOH byte[] the old
+/// CPU-side cache pinned. On UMA (integrated) GPUs the textures still occupy
+/// system RAM, but outside the managed heap — no GC pressure.
 /// </summary>
 sealed class ImageRenderer : IDisposable
 {
@@ -40,8 +42,9 @@ sealed class ImageRenderer : IDisposable
     int _texW, _texH;
 
     // Async loading: stale results are identified by generation. A pending item
-    // carries EITHER freshly decoded pixels (needs an upload) OR a ready GPU
-    // texture taken out of the prefetch cache (needs only a slot swap).
+    // carries EITHER a filled staging texture (worker already decoded straight
+    // into mapped upload memory — needs only its GPU copy recorded) OR a ready
+    // GPU texture taken out of the prefetch cache (needs only a slot swap).
     readonly ConcurrentQueue<PendingImage> _pendingImages = new();
     int _loadGeneration;
     int _decodesInFlight;         // user-requested decodes only (prefetch excluded)
@@ -49,7 +52,7 @@ sealed class ImageRenderer : IDisposable
 
     sealed record PendingImage(
         string Path, int Width, int Height,
-        byte[]? Pixels, GpuImage? Gpu, int Generation);
+        StagingTexture? Staging, GpuImage? Gpu, int Generation);
 
     /// <summary>An uploaded, draw-ready image: texture + SRV slot + dimensions.</summary>
     sealed record GpuImage(string Path, ID3D12Resource Texture, int SrvSlot,
@@ -71,12 +74,13 @@ sealed class ImageRenderer : IDisposable
     readonly HashSet<string> _prefetchInFlight = new(StringComparer.OrdinalIgnoreCase);
     long _prefetchBytes;
 
-    // Decoded prefetch pixels waiting for their upload — uploads may only be
-    // recorded on the render thread, so workers park results here and
-    // FlushPendingUpload drains at most one per frame. Bounded: during held-key
-    // browsing more prefetches can finish than frames drain; overflow results
-    // are dropped (a later Prefetch simply re-decodes if still relevant).
-    readonly ConcurrentQueue<(string Path, int W, int H, byte[] Pixels)> _prefetchUploads = new();
+    // Filled staging textures waiting for their GPU copy — recording commands
+    // is the ONLY render-thread step left, so FlushPendingUpload drains one per
+    // frame at microsecond cost. Bounded: each entry pins RowPitch × height of
+    // upload-heap memory; during held-key browsing more prefetches can finish
+    // than frames drain, and overflow results are abandoned (a later Prefetch
+    // simply re-decodes if still relevant).
+    readonly ConcurrentQueue<(string Path, StagingTexture Staging)> _prefetchUploads = new();
     int _prefetchUploadCount; // ConcurrentQueue.Count is O(n) — tracked manually
     const int PrefetchUploadQueueMax = 3;
 
@@ -159,20 +163,58 @@ sealed class ImageRenderer : IDisposable
         {
             try
             {
-                byte[] pixels = ImageDecoder.DecodeToBgra(path, out int w, out int h);
+                var staging = DecodeToStaging(path);
+                if (staging is null) return; // decode failed (already logged)
+
                 // Only enqueue if this is still the latest request.
                 if (Volatile.Read(ref _loadGeneration) == generation)
-                    _pendingImages.Enqueue(new PendingImage(path, w, h, pixels, null, generation));
-            }
-            catch (Exception ex)
-            {
-                Debug.WriteLine($"[ImageRenderer] Failed to decode '{path}': {ex.Message}");
+                {
+                    _pendingImages.Enqueue(new PendingImage(
+                        path, staging.Width, staging.Height, staging, null, generation));
+                }
+                else
+                {
+                    staging.Abandon(); // superseded before it finished
+                }
             }
             finally
             {
                 Interlocked.Decrement(ref _decodesInFlight);
             }
         });
+    }
+
+    /// <summary>
+    /// Decode on the CALLING (worker) thread straight into a fresh staging
+    /// texture: resource allocation, mapping and the full-image pixel write all
+    /// happen here — the render thread later only records the GPU copy
+    /// (<see cref="TextureUploader.FinishUpload"/>), which costs microseconds.
+    /// The WIC path writes rows directly from the format converter into the
+    /// mapped upload heap (no intermediate array at all); RAW/GDI+ fall back to
+    /// one worker-side row copy. Returns null on failure (logged).
+    /// </summary>
+    StagingTexture? DecodeToStaging(string path)
+    {
+        StagingTexture? staging = null;
+        try
+        {
+            ImageDecoder.DecodeToBgraDestination(path, (w, h) =>
+            {
+                // The decoder's fallback chain may retry after a codec failed
+                // mid-decode WITH a destination already allocated — abandon the
+                // superseded staging and hand out a fresh one.
+                staging?.Abandon();
+                staging = TextureUploader.PrepareStaging(_res, w, h);
+                return (staging.Mapped, staging.RowPitch);
+            }, out _, out _);
+            return staging;
+        }
+        catch (Exception ex)
+        {
+            Debug.WriteLine($"[ImageRenderer] Failed to decode '{path}': {ex.Message}");
+            staging?.Abandon();
+            return null;
+        }
     }
 
     /// <summary>
@@ -199,63 +241,62 @@ sealed class ImageRenderer : IDisposable
             // from "never prefetched" at the instant it happens — otherwise
             // LoadImageAsync could register a promotion against a result that
             // was just dropped, and that navigation would never complete.
-            try
+            var staging = DecodeToStaging(path);
+            lock (_prefetchLock)
             {
-                byte[] pixels = ImageDecoder.DecodeToBgra(path, out int w, out int h);
-                lock (_prefetchLock)
+                if (staging is null)
                 {
-                    if (_promotePath == path)
-                    {
-                        // A navigation request arrived mid-decode — deliver
-                        // straight to the pending queue under the recorded
-                        // generation (the "promotion" path).
-                        _pendingImages.Enqueue(new PendingImage(
-                            path, w, h, pixels, null, _promoteGeneration));
-                        _promotePath = null;
-                        _prefetchInFlight.Remove(path); // pipeline ends here
-                    }
-                    else if (Volatile.Read(ref _prefetchUploadCount) < PrefetchUploadQueueMax)
-                    {
-                        _prefetchUploads.Enqueue((path, w, h, pixels));
-                        Interlocked.Increment(ref _prefetchUploadCount);
-                        // stays in flight until ProcessOnePrefetchUpload drains it
-                    }
-                    else
-                    {
-                        // Upload backlog full — drop the pixels; a later
-                        // Prefetch re-decodes the file if it is still relevant.
-                        _prefetchInFlight.Remove(path);
-                    }
-                }
-            }
-            catch
-            {
-                // Corrupt/unsupported file — a real load attempt would fail the same
-                // way, so also drop any pending promotion registered for it.
-                lock (_prefetchLock)
-                {
+                    // Corrupt/unsupported file — a real load attempt would fail
+                    // the same way, so also drop any promotion registered for it.
                     if (_promotePath == path) _promotePath = null;
                     _prefetchInFlight.Remove(path);
+                }
+                else if (_promotePath == path)
+                {
+                    // A navigation request arrived mid-decode — deliver straight
+                    // to the pending queue under the recorded generation (the
+                    // "promotion" path).
+                    _pendingImages.Enqueue(new PendingImage(
+                        path, staging.Width, staging.Height, staging, null, _promoteGeneration));
+                    _promotePath = null;
+                    _prefetchInFlight.Remove(path); // pipeline ends here
+                }
+                else if (Volatile.Read(ref _prefetchUploadCount) < PrefetchUploadQueueMax)
+                {
+                    _prefetchUploads.Enqueue((path, staging));
+                    Interlocked.Increment(ref _prefetchUploadCount);
+                    // stays in flight until ProcessOnePrefetchUpload drains it
+                }
+                else
+                {
+                    // Upload backlog full — abandon the staging pair (never
+                    // touched by the GPU, so direct disposal is safe here);
+                    // a later Prefetch re-decodes the file if still relevant.
+                    _prefetchInFlight.Remove(path);
+                    staging.Abandon();
                 }
             }
         });
     }
 
     /// <summary>
-    /// Drain ONE queued prefetch result: upload it into the GPU cache (render
-    /// thread, recording into the frame's command list). One per frame bounds
-    /// the staging memcpy cost a single frame can pay.
+    /// Drain ONE queued prefetch result into the GPU cache. The staging texture
+    /// arrives already filled by the worker, so the render-thread cost here is
+    /// just recording the copy + barrier + SRV — microseconds; the pixel data
+    /// itself moves by an async GPU-side copy.
     /// </summary>
     void ProcessOnePrefetchUpload(ID3D12GraphicsCommandList cmdList)
     {
         if (!_prefetchUploads.TryDequeue(out var item)) return;
         Interlocked.Decrement(ref _prefetchUploadCount);
+        var (path, staging) = item;
 
         bool promote = false;
         int promoteGeneration = 0;
+        bool drop = false;
         lock (_prefetchLock)
         {
-            if (_promotePath == item.Path)
+            if (_promotePath == path)
             {
                 // A navigation request targeted this file while it sat in the
                 // upload queue — the second promotion completion point.
@@ -263,26 +304,31 @@ sealed class ImageRenderer : IDisposable
                 promoteGeneration = _promoteGeneration;
                 _promotePath = null;
             }
-            _prefetchInFlight.Remove(item.Path); // pipeline ends here either way
+            _prefetchInFlight.Remove(path); // pipeline ends here either way
 
             if (!promote
-                && (_prefetched.ContainsKey(item.Path)
-                    || (long)item.W * item.H * 4 > PrefetchMaxBytes))
+                && (_prefetched.ContainsKey(path)
+                    || (long)staging.Width * staging.Height * 4 > PrefetchMaxBytes))
             {
-                return; // duplicate, or larger than the whole budget — drop
+                drop = true; // duplicate, or larger than the whole budget
             }
         }
 
         if (promote)
         {
             _pendingImages.Enqueue(new PendingImage(
-                item.Path, item.W, item.H, item.Pixels, null, promoteGeneration));
+                path, staging.Width, staging.Height, staging, null, promoteGeneration));
+            return;
+        }
+        if (drop)
+        {
+            staging.Abandon(); // never reached the GPU — direct disposal is safe
             return;
         }
 
         int srvSlot = _res.AllocateSrvSlot();
-        var texture = TextureUploader.Upload(_res, item.W, item.H, item.Pixels, srvSlot, cmdList);
-        if (!TryInsertCache(new GpuImage(item.Path, texture, srvSlot, item.W, item.H)))
+        var texture = TextureUploader.FinishUpload(_res, staging, srvSlot, cmdList);
+        if (!TryInsertCache(new GpuImage(path, texture, srvSlot, staging.Width, staging.Height)))
             _res.DeferRelease(texture, srvSlot); // raced out — fence-tagged release
     }
 
@@ -355,30 +401,34 @@ sealed class ImageRenderer : IDisposable
     }
 
     /// <summary>A pending item that will never be applied: a ready texture goes
-    /// back into the cache (or is fence-released when it does not fit); a pixel
-    /// payload needs no action — the array is garbage the moment it is dropped.</summary>
+    /// back into the cache (or is fence-released when it does not fit); a
+    /// staging payload never reached the GPU, so it is destroyed directly.</summary>
     void RecycleOrRelease(PendingImage? img)
     {
-        if (img?.Gpu is not { } gpu) return;
-        if (!TryInsertCache(gpu))
-            _res.DeferRelease(gpu.Texture, gpu.SrvSlot);
+        if (img is null) return;
+        if (img.Gpu is { } gpu)
+        {
+            if (!TryInsertCache(gpu))
+                _res.DeferRelease(gpu.Texture, gpu.SrvSlot);
+        }
+        else
+        {
+            img.Staging?.Abandon();
+        }
     }
 
     /// <summary>
     /// Apply the pending load result on the render thread (between BeginFrame and
-    /// the draws): a cache hit is a pure texture swap; a fresh decode records its
-    /// upload into the frame's command list — the copy + barrier execute before
-    /// any draw recorded afterwards, so no GPU wait is needed. The OUTGOING
-    /// texture is recycled into the prefetch cache under its path (back-navigation
-    /// then costs nothing); only when it does not fit is it fence-released.
-    /// Afterwards, at most one queued prefetch result is uploaded into the cache —
-    /// skipped in frames that already paid for a main upload, so a single frame
-    /// never carries two full-image staging copies.
+    /// the draws): a cache hit is a pure texture swap; a fresh decode arrives as a
+    /// worker-filled staging texture, so only its GPU copy + barrier + SRV are
+    /// recorded here — microseconds, never a full-image memcpy (that happened on
+    /// the worker, or not at all on the WIC path). The OUTGOING texture is
+    /// recycled into the prefetch cache under its path (back-navigation then
+    /// costs nothing); only when it does not fit is it fence-released.
+    /// Afterwards one queued prefetch result is drained the same record-only way.
     /// </summary>
     public void FlushPendingUpload(ID3D12GraphicsCommandList cmdList)
     {
-        bool mainUploaded = false;
-
         if (_pendingApply is { } pending)
         {
             _pendingApply = null;
@@ -391,16 +441,13 @@ sealed class ImageRenderer : IDisposable
             else
             {
                 int srvSlot = _res.AllocateSrvSlot();
-                var texture = TextureUploader.Upload(
-                    _res, pending.Width, pending.Height, pending.Pixels!, srvSlot, cmdList);
+                var texture = TextureUploader.FinishUpload(_res, pending.Staging!, srvSlot, cmdList);
                 _current = new GpuImage(pending.Path, texture, srvSlot,
                                         pending.Width, pending.Height);
-                mainUploaded = true;
             }
         }
 
-        if (!mainUploaded)
-            ProcessOnePrefetchUpload(cmdList);
+        ProcessOnePrefetchUpload(cmdList);
     }
 
     /// <summary>Detach the displayed texture and recycle it into the prefetch
@@ -564,10 +611,17 @@ sealed class ImageRenderer : IDisposable
 
         if (_current is { } current) { Destroy(current); _current = null; }
         if (_pendingApply?.Gpu is { } pendingGpu) Destroy(pendingGpu);
+        _pendingApply?.Staging?.Abandon();
         _pendingApply = null;
 
         while (_pendingImages.TryDequeue(out var p))
+        {
             if (p.Gpu is { } g) Destroy(g);
+            p.Staging?.Abandon();
+        }
+
+        while (_prefetchUploads.TryDequeue(out var u))
+            u.Staging.Abandon();
 
         lock (_prefetchLock)
         {
