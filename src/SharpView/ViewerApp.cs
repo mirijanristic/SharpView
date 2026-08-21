@@ -507,6 +507,18 @@ sealed class ViewerApp : IDisposable
     /// </summary>
     void OnFrozenResizeTick(int offsetX, int offsetY, int width, int height)
     {
+        // Keep the thumbnail strip's ON-SCREEN position continuous across the
+        // instant view-offset jump. The strip animates its centering in window
+        // coordinates; when the offset moves per tick (left/top-edge drags)
+        // while the parked window stays put, its screen motion would compose
+        // as "instant jump + lagging counter-animation" — reading as the strip
+        // sticking to the dragged edge — while a right-edge drag (constant
+        // offset) is pure smooth trailing. Shifting the animated scroll by the
+        // offset delta makes both edges identically fluid. Only the ticks need
+        // this: at Begin/End the offset change is exactly canceled by the
+        // simultaneous window move, so nothing jumps on screen there.
+        _thumbStrip.CompensateViewShift(offsetX - _viewOffsetX);
+
         _viewOffsetX = offsetX;
         _viewOffsetY = offsetY;
         _width = width;

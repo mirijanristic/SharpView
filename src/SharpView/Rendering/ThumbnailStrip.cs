@@ -262,6 +262,21 @@ sealed class ThumbnailStrip
         _targetScrollOffset = offset;
     }
 
+    /// <summary>
+    /// Shifts the ANIMATED scroll state by the given pixel delta — called when
+    /// the view offset moves INSTANTLY (frozen-resize mouse tick), so the
+    /// strip's on-screen position stays continuous. The strip centers itself in
+    /// WINDOW coordinates with an animated scroll; a left-edge drag (where the
+    /// offset jumps per tick while the parked window stays put) would otherwise
+    /// compose as "instant jump with the dragged edge + lagging counter-
+    /// animation" — the strip looks rigidly glued to the edge and then relaxes
+    /// back — while a right-edge drag (constant offset) is pure smooth
+    /// trailing. Pre-compensating the delta makes both edges read as the same
+    /// fluid follow. The target is deliberately untouched: Update recomputes it
+    /// from the window width every frame anyway.
+    /// </summary>
+    public void CompensateViewShift(float dx) => _scrollOffset -= dx;
+
     /// <summary>Get the thumbnail index at a given screen position, or -1.</summary>
     public int HitTest(float screenX, float screenY, int windowWidth, int windowHeight, int fileCount)
     {
