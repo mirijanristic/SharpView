@@ -11,16 +11,23 @@ namespace SharpView.Rendering;
 /// Renders the main image view with zoom, pan, and smooth animation.
 /// Image decode happens on a background thread; the GPU upload is recorded directly
 /// into the frame's command list, so navigation never blocks on the GPU.
-/// A small bounded CPU-side prefetch cache keeps the neighboring images pre-decoded,
-/// which makes next/previous navigation effectively instant.
+/// A small bounded GPU-RESIDENT prefetch cache keeps the neighboring images as
+/// ready textures (decoded AND uploaded), so next/previous navigation is a pure
+/// SRV-slot swap — no decode, no upload. Pixels exist on the CPU only while in
+/// transit (decode → upload queue → texture), which removes the half-gigabyte of
+/// LOH byte[] the old CPU-side cache pinned. On UMA (integrated) GPUs the textures
+/// still occupy system RAM, but outside the managed heap — no GC pressure.
 /// </summary>
 sealed class ImageRenderer : IDisposable
 {
     readonly DeviceResources _res;
     readonly ZoomPanController _view = new();
 
-    ID3D12Resource? _texture;
-    int _srvSlot = -1;
+    // The displayed image as one GPU object (texture + SRV slot + its own
+    // dimensions and source path). The path is what lets the texture be
+    // recycled INTO the prefetch cache when navigating away, instead of being
+    // destroyed — going back to a recent image is then a pure slot swap.
+    GpuImage? _current;
     const int CbSlot = 0;
     // Live-resize camouflage pass (see RenderUnderlay). 41 = first slot past
     // TopBar's block (37..40); ThumbnailStrip owns 1..36.
@@ -32,38 +39,67 @@ sealed class ImageRenderer : IDisposable
 
     int _texW, _texH;
 
-    // Async loading: stale decodes are identified by generation and dropped.
-    readonly ConcurrentQueue<DecodedImage> _pendingImages = new();
+    // Async loading: stale results are identified by generation. A pending item
+    // carries EITHER freshly decoded pixels (needs an upload) OR a ready GPU
+    // texture taken out of the prefetch cache (needs only a slot swap).
+    readonly ConcurrentQueue<PendingImage> _pendingImages = new();
     int _loadGeneration;
-    int _decodesInFlight;            // user-requested decodes only (prefetch excluded)
-    byte[]? _pendingUploadPixels;    // picked up by FlushPendingUpload on the render thread
+    int _decodesInFlight;         // user-requested decodes only (prefetch excluded)
+    PendingImage? _pendingApply;  // polled result, consumed by FlushPendingUpload
 
-    sealed record DecodedImage(int Width, int Height, byte[] Pixels, int Generation);
+    sealed record PendingImage(
+        string Path, int Width, int Height,
+        byte[]? Pixels, GpuImage? Gpu, int Generation);
 
-    // ── Prefetch cache: decoded neighbor images kept in CPU memory ──
+    /// <summary>An uploaded, draw-ready image: texture + SRV slot + dimensions.</summary>
+    sealed record GpuImage(string Path, ID3D12Resource Texture, int SrvSlot,
+                           int Width, int Height)
+    {
+        /// <summary>Approximate GPU memory footprint (BGRA, no mips).</summary>
+        public long Bytes => (long)Width * Height * 4;
+    }
+
+    // ── Prefetch cache: neighbor images kept as READY GPU textures ──
+    // Budget counts texture bytes (W×H×4), not managed memory. Deliberately
+    // smaller than the old CPU cache's 512 MB: VRAM is the scarcer resource on
+    // discrete cards, and 256 MB still holds two+ 24-megapixel photographs.
     const int PrefetchMaxEntries = 4;
-    const long PrefetchMaxBytes = 512L * 1024 * 1024;
+    const long PrefetchMaxBytes = 256L * 1024 * 1024;
     readonly object _prefetchLock = new();
-    readonly Dictionary<string, DecodedImage> _prefetched = new(StringComparer.OrdinalIgnoreCase);
+    readonly Dictionary<string, GpuImage> _prefetched = new(StringComparer.OrdinalIgnoreCase);
     readonly LinkedList<string> _prefetchOrder = new(); // most-recent first
     readonly HashSet<string> _prefetchInFlight = new(StringComparer.OrdinalIgnoreCase);
     long _prefetchBytes;
 
-    // Promotion: when a navigation request targets a file that is currently being
-    // prefetched, the finished prefetch is delivered directly to the pending queue
-    // instead of decoding the same image a second time. Guarded by _prefetchLock.
+    // Decoded prefetch pixels waiting for their upload — uploads may only be
+    // recorded on the render thread, so workers park results here and
+    // FlushPendingUpload drains at most one per frame. Bounded: during held-key
+    // browsing more prefetches can finish than frames drain; overflow results
+    // are dropped (a later Prefetch simply re-decodes if still relevant).
+    readonly ConcurrentQueue<(string Path, int W, int H, byte[] Pixels)> _prefetchUploads = new();
+    int _prefetchUploadCount; // ConcurrentQueue.Count is O(n) — tracked manually
+    const int PrefetchUploadQueueMax = 3;
+
+    // Promotion: when a navigation request targets a file whose prefetch is in
+    // flight (still decoding OR already decoded and waiting in the upload
+    // queue), the result is delivered straight to the pending queue instead of
+    // decoding the same image a second time. Guarded by _prefetchLock; both
+    // completion points (decode finish, upload-queue drain) honor it.
     string? _promotePath;
     int _promoteGeneration;
 
     public bool HasImage => _texW > 0;
     public bool IsOneToOne => _view.IsOneToOne;
 
-    /// <summary>True while a decode or GPU upload for the main image is outstanding.
-    /// The render loop keeps running while this is true so the image appears promptly.</summary>
+    /// <summary>True while a decode or GPU upload is outstanding — for the main
+    /// image OR a queued prefetch upload. The render loop keeps running while
+    /// this is true: the main image appears promptly, and prefetch results need
+    /// frames too (their upload is recorded into a frame's command list).</summary>
     public bool IsBusy =>
         Volatile.Read(ref _decodesInFlight) > 0
         || !_pendingImages.IsEmpty
-        || _pendingUploadPixels is not null;
+        || _pendingApply is not null
+        || Volatile.Read(ref _prefetchUploadCount) > 0;
 
     /// <summary>True when the zoom/pan animation has reached its targets.</summary>
     public bool IsAnimationSettled => _view.IsSettled;
@@ -81,23 +117,26 @@ sealed class ImageRenderer : IDisposable
     {
         int generation = Interlocked.Increment(ref _loadGeneration);
 
-        DecodedImage? cached = null;
+        GpuImage? cached = null;
         lock (_prefetchLock)
         {
             if (_prefetched.Remove(path, out cached))
             {
-                // Prefetched and ready — no decode needed at all.
+                // Prefetched and READY — the texture is already on the GPU, so
+                // the ownership simply transfers out of the cache: no decode,
+                // no upload, just a slot swap when the pending item is applied.
                 _prefetchOrder.Remove(path); // O(n), n ≤ PrefetchMaxEntries
-                _prefetchBytes -= cached.Pixels.LongLength;
+                _prefetchBytes -= cached.Bytes;
                 _promotePath = null;
             }
             else if (_prefetchInFlight.Contains(path))
             {
-                // This exact file is being decoded by a prefetch worker right now.
-                // Starting a second decode would double the work during fast browsing,
-                // so register a promotion instead: when the prefetch finishes,
-                // StorePrefetched delivers it straight into the pending queue under
-                // this generation.
+                // This exact file is in the prefetch pipeline right now (still
+                // decoding, or decoded and waiting for its upload turn).
+                // Starting a second decode would double the work during fast
+                // browsing, so register a promotion instead: whichever pipeline
+                // stage finishes first delivers the pixels straight into the
+                // pending queue under this generation.
                 _promotePath = path;
                 _promoteGeneration = generation;
                 return;
@@ -110,7 +149,8 @@ sealed class ImageRenderer : IDisposable
 
         if (cached is not null)
         {
-            _pendingImages.Enqueue(cached with { Generation = generation });
+            _pendingImages.Enqueue(new PendingImage(
+                path, cached.Width, cached.Height, null, cached, generation));
             return;
         }
 
@@ -122,7 +162,7 @@ sealed class ImageRenderer : IDisposable
                 byte[] pixels = ImageDecoder.DecodeToBgra(path, out int w, out int h);
                 // Only enqueue if this is still the latest request.
                 if (Volatile.Read(ref _loadGeneration) == generation)
-                    _pendingImages.Enqueue(new DecodedImage(w, h, pixels, generation));
+                    _pendingImages.Enqueue(new PendingImage(path, w, h, pixels, null, generation));
             }
             catch (Exception ex)
             {
@@ -136,8 +176,9 @@ sealed class ImageRenderer : IDisposable
     }
 
     /// <summary>
-    /// Decode <paramref name="path"/> in the background and keep the pixels in a small
-    /// bounded CPU cache so a later <see cref="LoadImageAsync"/> for it is instant.
+    /// Decode <paramref name="path"/> in the background and hand the pixels to the
+    /// render thread, which uploads them into the bounded GPU cache — a later
+    /// <see cref="LoadImageAsync"/> for the file is then a pure texture swap.
     /// Safe to call repeatedly; already-cached and in-flight paths are ignored.
     /// </summary>
     public void Prefetch(string path)
@@ -152,10 +193,40 @@ sealed class ImageRenderer : IDisposable
 
         ThreadPool.QueueUserWorkItem(_ =>
         {
+            // Every branch settles _prefetchInFlight ATOMICALLY with its
+            // decision, inside one lock: "in flight" must cover the WHOLE
+            // pipeline (decode + upload), and a drop must be indistinguishable
+            // from "never prefetched" at the instant it happens — otherwise
+            // LoadImageAsync could register a promotion against a result that
+            // was just dropped, and that navigation would never complete.
             try
             {
                 byte[] pixels = ImageDecoder.DecodeToBgra(path, out int w, out int h);
-                StorePrefetched(path, new DecodedImage(w, h, pixels, 0));
+                lock (_prefetchLock)
+                {
+                    if (_promotePath == path)
+                    {
+                        // A navigation request arrived mid-decode — deliver
+                        // straight to the pending queue under the recorded
+                        // generation (the "promotion" path).
+                        _pendingImages.Enqueue(new PendingImage(
+                            path, w, h, pixels, null, _promoteGeneration));
+                        _promotePath = null;
+                        _prefetchInFlight.Remove(path); // pipeline ends here
+                    }
+                    else if (Volatile.Read(ref _prefetchUploadCount) < PrefetchUploadQueueMax)
+                    {
+                        _prefetchUploads.Enqueue((path, w, h, pixels));
+                        Interlocked.Increment(ref _prefetchUploadCount);
+                        // stays in flight until ProcessOnePrefetchUpload drains it
+                    }
+                    else
+                    {
+                        // Upload backlog full — drop the pixels; a later
+                        // Prefetch re-decodes the file if it is still relevant.
+                        _prefetchInFlight.Remove(path);
+                    }
+                }
             }
             catch
             {
@@ -164,98 +235,188 @@ sealed class ImageRenderer : IDisposable
                 lock (_prefetchLock)
                 {
                     if (_promotePath == path) _promotePath = null;
+                    _prefetchInFlight.Remove(path);
                 }
-            }
-            finally
-            {
-                lock (_prefetchLock) _prefetchInFlight.Remove(path);
             }
         });
     }
 
-    void StorePrefetched(string path, DecodedImage img)
+    /// <summary>
+    /// Drain ONE queued prefetch result: upload it into the GPU cache (render
+    /// thread, recording into the frame's command list). One per frame bounds
+    /// the staging memcpy cost a single frame can pay.
+    /// </summary>
+    void ProcessOnePrefetchUpload(ID3D12GraphicsCommandList cmdList)
     {
-        long size = img.Pixels.LongLength;
+        if (!_prefetchUploads.TryDequeue(out var item)) return;
+        Interlocked.Decrement(ref _prefetchUploadCount);
 
+        bool promote = false;
+        int promoteGeneration = 0;
         lock (_prefetchLock)
         {
-            // A navigation request for this exact file arrived while it was still
-            // decoding — deliver it straight to the pending queue under the recorded
-            // generation instead of caching it (the "promotion" path). This is what
-            // prevents decoding the same image twice during fast arrow-key browsing.
-            if (_promotePath == path)
+            if (_promotePath == item.Path)
             {
-                _pendingImages.Enqueue(img with { Generation = _promoteGeneration });
+                // A navigation request targeted this file while it sat in the
+                // upload queue — the second promotion completion point.
+                promote = true;
+                promoteGeneration = _promoteGeneration;
                 _promotePath = null;
-                return;
             }
+            _prefetchInFlight.Remove(item.Path); // pipeline ends here either way
 
-            if (size > PrefetchMaxBytes) return; // larger than the entire budget — skip
-            if (_prefetched.ContainsKey(path)) return;
+            if (!promote
+                && (_prefetched.ContainsKey(item.Path)
+                    || (long)item.W * item.H * 4 > PrefetchMaxBytes))
+            {
+                return; // duplicate, or larger than the whole budget — drop
+            }
+        }
 
-            _prefetched[path] = img;
-            _prefetchOrder.AddFirst(path);
-            _prefetchBytes += size;
+        if (promote)
+        {
+            _pendingImages.Enqueue(new PendingImage(
+                item.Path, item.W, item.H, item.Pixels, null, promoteGeneration));
+            return;
+        }
 
-            // Evict oldest entries beyond the entry/byte budget.
+        int srvSlot = _res.AllocateSrvSlot();
+        var texture = TextureUploader.Upload(_res, item.W, item.H, item.Pixels, srvSlot, cmdList);
+        if (!TryInsertCache(new GpuImage(item.Path, texture, srvSlot, item.W, item.H)))
+            _res.DeferRelease(texture, srvSlot); // raced out — fence-tagged release
+    }
+
+    /// <summary>Insert a ready texture into the cache, evicting LRU entries past
+    /// the entry/byte budget (fence-tagged, no stall). False when the image does
+    /// not fit or the path is already cached — the caller keeps ownership.</summary>
+    bool TryInsertCache(GpuImage img)
+    {
+        lock (_prefetchLock)
+        {
+            if (img.Bytes > PrefetchMaxBytes) return false; // larger than the entire budget
+            if (_prefetched.ContainsKey(img.Path)) return false;
+
+            _prefetched[img.Path] = img;
+            _prefetchOrder.AddFirst(img.Path);
+            _prefetchBytes += img.Bytes;
+
+            // Evict oldest entries beyond the entry/byte budget. The textures
+            // may still be referenced by an in-flight frame, so release is
+            // fence-tagged (same pattern as ThumbnailCache eviction).
             while ((_prefetched.Count > PrefetchMaxEntries || _prefetchBytes > PrefetchMaxBytes)
                    && _prefetchOrder.Last is not null)
             {
                 string oldest = _prefetchOrder.Last.Value;
                 _prefetchOrder.RemoveLast();
                 if (_prefetched.Remove(oldest, out var evicted))
-                    _prefetchBytes -= evicted.Pixels.LongLength;
+                {
+                    _prefetchBytes -= evicted.Bytes;
+                    _res.DeferRelease(evicted.Texture, evicted.SrvSlot);
+                }
             }
+            return true;
         }
     }
 
     /// <summary>
-    /// Pick up the newest finished decode (CPU side only). Returns true if a new image
-    /// arrived: dimensions are updated immediately so the caller can re-fit the view;
-    /// the actual GPU upload is recorded by <see cref="FlushPendingUpload"/> during
-    /// the next frame.
+    /// Pick up the newest finished load result. Returns true if a new image
+    /// arrived: dimensions are updated immediately so the caller can re-fit the
+    /// view; the actual apply (texture swap or GPU upload) happens in
+    /// <see cref="FlushPendingUpload"/> during the next frame. Stale results
+    /// carrying a ready texture are recycled into the prefetch cache — during
+    /// fast browsing, the images skipped past stay warm for back-navigation.
     /// </summary>
     public bool PollDecodedImage()
     {
-        DecodedImage? latest = null;
+        PendingImage? latest = null;
         int currentGeneration = Volatile.Read(ref _loadGeneration);
 
-        // Drain the queue, keep only the latest decode matching the current generation.
+        // Drain the queue, keep only the latest result matching the current generation.
         while (_pendingImages.TryDequeue(out var img))
         {
             if (img.Generation == currentGeneration)
+            {
+                RecycleOrRelease(latest);
                 latest = img;
+            }
+            else
+            {
+                RecycleOrRelease(img); // stale — pixel payloads just fall to the GC
+            }
         }
 
         if (latest is null) return false;
 
+        RecycleOrRelease(_pendingApply); // superseded before it was ever applied
+        _pendingApply = latest;
         _texW = latest.Width;
         _texH = latest.Height;
-        _pendingUploadPixels = latest.Pixels;
         return true;
     }
 
+    /// <summary>A pending item that will never be applied: a ready texture goes
+    /// back into the cache (or is fence-released when it does not fit); a pixel
+    /// payload needs no action — the array is garbage the moment it is dropped.</summary>
+    void RecycleOrRelease(PendingImage? img)
+    {
+        if (img?.Gpu is not { } gpu) return;
+        if (!TryInsertCache(gpu))
+            _res.DeferRelease(gpu.Texture, gpu.SrvSlot);
+    }
+
     /// <summary>
-    /// Record the pending texture upload into the frame's command list (render thread,
-    /// between BeginFrame and the draws). The copy + barrier execute before any draw
-    /// recorded afterwards, so no GPU wait is needed. The previous texture and its SRV
-    /// slot are released via fence-tagged deferral once no in-flight frame can
-    /// reference them anymore.
+    /// Apply the pending load result on the render thread (between BeginFrame and
+    /// the draws): a cache hit is a pure texture swap; a fresh decode records its
+    /// upload into the frame's command list — the copy + barrier execute before
+    /// any draw recorded afterwards, so no GPU wait is needed. The OUTGOING
+    /// texture is recycled into the prefetch cache under its path (back-navigation
+    /// then costs nothing); only when it does not fit is it fence-released.
+    /// Afterwards, at most one queued prefetch result is uploaded into the cache —
+    /// skipped in frames that already paid for a main upload, so a single frame
+    /// never carries two full-image staging copies.
     /// </summary>
     public void FlushPendingUpload(ID3D12GraphicsCommandList cmdList)
     {
-        if (_pendingUploadPixels is null) return;
+        bool mainUploaded = false;
 
-        if (_texture is not null)
+        if (_pendingApply is { } pending)
         {
-            _res.DeferRelease(_texture, _srvSlot);
-            _texture = null;
-            _srvSlot = -1;
+            _pendingApply = null;
+            RetireCurrent(pending.Path);
+
+            if (pending.Gpu is { } ready)
+            {
+                _current = ready; // prefetch hit: already on the GPU — pure swap
+            }
+            else
+            {
+                int srvSlot = _res.AllocateSrvSlot();
+                var texture = TextureUploader.Upload(
+                    _res, pending.Width, pending.Height, pending.Pixels!, srvSlot, cmdList);
+                _current = new GpuImage(pending.Path, texture, srvSlot,
+                                        pending.Width, pending.Height);
+                mainUploaded = true;
+            }
         }
 
-        _srvSlot = _res.AllocateSrvSlot();
-        _texture = TextureUploader.Upload(_res, _texW, _texH, _pendingUploadPixels, _srvSlot, cmdList);
-        _pendingUploadPixels = null;
+        if (!mainUploaded)
+            ProcessOnePrefetchUpload(cmdList);
+    }
+
+    /// <summary>Detach the displayed texture and recycle it into the prefetch
+    /// cache under its own path — unless the incoming image IS the same file
+    /// (caching the old copy would duplicate it) or it does not fit the budget;
+    /// then it is released fence-tagged like before.</summary>
+    void RetireCurrent(string incomingPath)
+    {
+        if (_current is not { } old) return;
+        _current = null;
+
+        if (string.Equals(old.Path, incomingPath, StringComparison.OrdinalIgnoreCase)
+            || !TryInsertCache(old))
+        {
+            _res.DeferRelease(old.Texture, old.SrvSlot);
+        }
     }
 
     /// <summary>Update the smooth animation and write this frame's constants. Call each frame.</summary>
@@ -310,8 +471,8 @@ sealed class ImageRenderer : IDisposable
     /// <summary>Issue the draw call. The viewport must be set by the caller.</summary>
     public void Render()
     {
-        if (_texture is null) return;
-        _res.DrawQuad(_srvSlot, CbSlot);
+        if (_current is null) return;
+        _res.DrawQuad(_current.SrvSlot, CbSlot);
     }
 
     /// <summary>
@@ -330,7 +491,7 @@ sealed class ImageRenderer : IDisposable
     /// </summary>
     public void RenderUnderlay(int bufferW, int bufferH)
     {
-        if (_texture is null) return;
+        if (_current is null) return;
         if (bufferW <= 0 || bufferH <= 0) return;
 
         // Same destination rectangle as the last Update, re-expressed in the
@@ -350,7 +511,7 @@ sealed class ImageRenderer : IDisposable
             TintColor = Vector4.Zero, // textured mode
         };
         _res.WriteConstants(CbSlotUnderlay, cb);
-        _res.DrawQuad(_srvSlot, CbSlotUnderlay);
+        _res.DrawQuad(_current.SrvSlot, CbSlotUnderlay);
     }
 
     // ─── Zoom/Pan Controls ────────────────────────────────────────────
@@ -393,12 +554,28 @@ sealed class ImageRenderer : IDisposable
 
     public void Dispose()
     {
-        // ViewerApp performs a full GPU wait before disposing renderers.
-        _texture?.Dispose();
-        if (_srvSlot >= 0)
+        // ViewerApp performs a full GPU wait before disposing renderers, so
+        // everything below can be released directly (no fence tagging needed).
+        void Destroy(GpuImage img)
         {
-            _res.FreeSrvSlot(_srvSlot);
-            _srvSlot = -1;
+            img.Texture.Dispose();
+            _res.FreeSrvSlot(img.SrvSlot);
+        }
+
+        if (_current is { } current) { Destroy(current); _current = null; }
+        if (_pendingApply?.Gpu is { } pendingGpu) Destroy(pendingGpu);
+        _pendingApply = null;
+
+        while (_pendingImages.TryDequeue(out var p))
+            if (p.Gpu is { } g) Destroy(g);
+
+        lock (_prefetchLock)
+        {
+            foreach (var kv in _prefetched)
+                Destroy(kv.Value);
+            _prefetched.Clear();
+            _prefetchOrder.Clear();
+            _prefetchBytes = 0;
         }
     }
 }
